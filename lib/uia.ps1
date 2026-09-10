@@ -1,5 +1,5 @@
 # dsh-computer-use UIA kernel (Windows, PowerShell 5.1)
-# Design: one PowerShell process per tool call. Action params via stdin JSON, result via stdout JSON.
+# Design: one resident PowerShell process serves serialized JSON-line requests.
 # Tool semantics align with OpenAI Codex Computer Use (macOS): element_index is first-class,
 # screenshot pixel coordinates are the fallback, get_app_state returns screenshot + AX tree.
 $ErrorActionPreference = 'Stop'
@@ -28,9 +28,15 @@ $script:SystemDpiScale = [Math]::Max(1.0, [CuDpiFix]::GetDpiForSystem() / 96.0)
 
 Add-Type -TypeDefinition @"
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
 public static class CuNative {
+  public sealed class VisibleWindow {
+    public long Hwnd;
+    public uint Pid;
+    public string Title;
+  }
   public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
@@ -67,6 +73,21 @@ public static class CuNative {
       found = h; return false;
     }, IntPtr.Zero);
     return found;
+  }
+  public static VisibleWindow[] ListVisibleWindows() {
+    List<VisibleWindow> windows = new List<VisibleWindow>();
+    EnumWindows((h, l) => {
+      int length = GetWindowTextLengthW(h);
+      if (!IsWindowVisible(h) || length <= 0) return true;
+      StringBuilder sb = new StringBuilder(length + 1);
+      GetWindowTextW(h, sb, sb.Capacity);
+      uint pid;
+      if (GetWindowThreadProcessId(h, out pid) != 0 && pid != 0) {
+        windows.Add(new VisibleWindow { Hwnd = h.ToInt64(), Pid = pid, Title = sb.ToString() });
+      }
+      return true;
+    }, IntPtr.Zero);
+    return windows.ToArray();
   }
 }
 "@
@@ -249,9 +270,26 @@ function Resolve-Window($target) {
     if ($fg -ne [IntPtr]::Zero) { return $fg }
     return $null
   }
-  if ($app -match '^\d+$') {
-    $proc = Get-Process -Id ([int]$app) -ErrorAction SilentlyContinue
+  if ($app -match '^pid:(\d+)$') {
+    $proc = Get-Process -Id ([int]$Matches[1]) -ErrorAction SilentlyContinue
     if ($proc -and $proc.MainWindowHandle -ne [IntPtr]::Zero) { return $proc.MainWindowHandle }
+    return $null
+  }
+  if ($app -match '^hwnd:(\d+)$') {
+    $candidate = [IntPtr]([int64]$Matches[1])
+    if ([CuNative]::IsWindowVisible($candidate)) { return $candidate }
+    return $null
+  }
+  if ($app -match '^\d+$') {
+    # Bare numbers keep the historic PID-first behaviour, then fall back to a
+    # native HWND. Explicit pid:/hwnd: selectors remove any ambiguity.
+    $pidValue = 0
+    if ([int]::TryParse($app, [ref]$pidValue)) {
+      $proc = Get-Process -Id $pidValue -ErrorAction SilentlyContinue
+      if ($proc -and $proc.MainWindowHandle -ne [IntPtr]::Zero) { return $proc.MainWindowHandle }
+    }
+    $candidate = [IntPtr]([int64]$app)
+    if ([CuNative]::IsWindowVisible($candidate)) { return $candidate }
   }
   $procs = Get-Process -ErrorAction SilentlyContinue | Where-Object {
     $_.MainWindowHandle -ne [IntPtr]::Zero -and (
@@ -435,23 +473,25 @@ function Invoke-Drag($fromX, $fromY, $toX, $toY, $button) {
 }
 
 function Invoke-Scroll($x, $y, $direction, $amount) {
-  $delta = [Math]::Abs([int]$amount)
+  # $amount is a wheel-notch count (one notch = WHEEL_DELTA 120 = ~3 lines).
+  $notches = [Math]::Max(1, [int][Math]::Round([double]$amount))
   $horizontal = ($direction -eq 'left' -or $direction -eq 'right')
-  if ($horizontal) {
-    # WM_HSCROLL convention: positive wheel delta tilts right
-    if ($direction -eq 'left') { $delta = -$delta }
-    $wheel = $MOUSEEVENTF_HWHEEL
-  } else {
-    if ($direction -eq 'down') { $delta = -$delta }
-    $wheel = $MOUSEEVENTF_WHEEL
-  }
+  # WM_HSCROLL convention: positive wheel delta tilts right;
+  # vertical: positive delta scrolls up, so down must be negative.
+  $dir = 1
+  if ($direction -eq 'left' -or $direction -eq 'down') { $dir = -1 }
+  $wheel = if ($horizontal) { $MOUSEEVENTF_HWHEEL } else { $MOUSEEVENTF_WHEEL }
   Invoke-WithBorrowedCursor {
-    [void][CuInput]::SendMouse(
-      [uint32[]]@($MOVE_ABS, $wheel),
-      [int[]]@($x, $x),
-      [int[]]@($y, $y),
-      [int[]]@(0, $delta))
-    Start-Sleep -Milliseconds 40
+    # Windows clamps huge single deltas; send one event per notch instead so
+    # apps accumulate them into a real page-length scroll.
+    for ($i = 0; $i -lt $notches; $i++) {
+      [void][CuInput]::SendMouse(
+        [uint32[]]@($MOVE_ABS, $wheel),
+        [int[]]@($x, $x),
+        [int[]]@($y, $y),
+        [int[]]@(0, [int](120 * $dir)))
+      Start-Sleep -Milliseconds 12
+    }
   }
 }
 
@@ -734,12 +774,13 @@ function Get-ColLabel([int]$i) {
 }
 
 function Get-GridMarkers($elements, $windowRect) {
-  # Candidate interactive elements: Invoke secondary action or settable,
+  # Candidate interactive elements: actionable secondary pattern or settable,
   # enabled, at least 20px in both dimensions, inside the window (1px slack).
   $cands = @()
   foreach ($e in $elements) {
     if (-not $e.enabled) { continue }
-    if (-not ($e.secondaryActions -contains 'Invoke') -and -not $e.settable) { continue }
+    $actionable = @($e.secondaryActions | Where-Object { $_ -in @('Invoke','Toggle','ExpandCollapse','SelectionItem','ScrollItem') }).Count -gt 0
+    if (-not $actionable -and -not $e.settable) { continue }
     if ($e.frame.width -lt 20 -or $e.frame.height -lt 20) { continue }
     if ($e.frame.x -lt -1 -or $e.frame.y -lt -1) { continue }
     if (($e.frame.x + $e.frame.width) -gt ($windowRect.width + 1)) { continue }
@@ -924,8 +965,9 @@ function Get-AutomationRoot([IntPtr]$hwnd) {
 }
 
 function Invoke-GetState($params) {
-  $maxDepth = if ($null -ne $params.maxDepth) { [int]$params.maxDepth } else { 8 }
-  $maxNodes = if ($null -ne $params.maxNodes) { [int]$params.maxNodes } else { 400 }
+  $timer = [System.Diagnostics.Stopwatch]::StartNew()
+  $maxDepth = if ($null -ne $params.maxDepth) { [Math]::Max(0, [Math]::Min(50, [int]$params.maxDepth)) } else { 8 }
+  $maxNodes = if ($null -ne $params.maxNodes) { [Math]::Max(1, [Math]::Min(5000, [int]$params.maxNodes)) } else { 400 }
   $includeScreenshot = if ($null -eq $params.includeScreenshot) { $true } else { [bool]$params.includeScreenshot }
 
   $hwnd = Resolve-Window $params
@@ -943,6 +985,7 @@ function Invoke-GetState($params) {
   }
 
   $rect = Get-WindowRectArr $hwnd
+  if ($null -eq $rect -or $rect.width -le 0 -or $rect.height -le 0) { Fail 'target window has no capturable bounds' }
   $windowInfo = Get-ProcessInfo $hwnd
   $fg = [CuNative]::GetForegroundWindow()
   $isForeground = ($fg -eq $hwnd)
@@ -954,8 +997,11 @@ function Invoke-GetState($params) {
   $queue = New-Object System.Collections.Queue
   $queue.Enqueue(@{ el = $root; path = @() })
   $depthTruncated = $false
-  while ($queue.Count -gt 0 -and $elements.Count -lt $maxNodes) {
+  $nodeTruncated = $false
+  $visitedCount = 0
+  while ($queue.Count -gt 0 -and $visitedCount -lt $maxNodes) {
     $node = $queue.Dequeue()
+    $visitedCount++
     $el = $node.el; $path = $node.path
     $index = $elements.Count
 
@@ -1011,22 +1057,21 @@ function Invoke-GetState($params) {
 
     # maxDepth is the deepest level that may be captured: the window root is
     # depth 0, so a node expands only while its children stay within the budget.
-    if ($elements.Count -ge $maxNodes) {
-      # node budget exhausted
-    } elseif (($path.Count + 1) -gt $maxDepth) {
+    if (($path.Count + 1) -gt $maxDepth) {
       $depthTruncated = $true
     } else {
       try {
         $children = $el.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)
         $i = 0
         foreach ($child in $children) {
-          if ($elements.Count -ge $maxNodes) { break }
+          if (($visitedCount + $queue.Count) -ge $maxNodes) { $nodeTruncated = $true; break }
           $queue.Enqueue(@{ el = $child; path = $path + $i })
           $i++
         }
       } catch {}
     }
   }
+  if ($queue.Count -gt 0) { $nodeTruncated = $true }
 
   $screenshot = ''
   $markers = @()
@@ -1083,12 +1128,12 @@ function Invoke-GetState($params) {
     window = @{ hwnd = $hwnd.ToInt64(); pid = $windowInfo.pid; processName = $windowInfo.processName; title = $winTitle; bounds = $rect; foreground = $isForeground }
     elements = $elements
     elementCount = $elements.Count
-    nodeCount = $elements.Count
-    truncated = (($elements.Count -ge $maxNodes) -or $depthTruncated)
-    truncatedByNodes = ($elements.Count -ge $maxNodes)
+    nodeCount = $visitedCount
+    truncated = ($nodeTruncated -or $depthTruncated)
+    truncatedByNodes = $nodeTruncated
     truncatedByDepth = $depthTruncated
     maxDepth = $maxDepth
-    durationMs = 0
+    durationMs = [int]$timer.ElapsedMilliseconds
     screenshot = $screenshot
     screenshotWidth = $rect.width
     screenshotHeight = $rect.height
@@ -1104,18 +1149,16 @@ function Invoke-GetState($params) {
 function Invoke-ListApps($params) {
   $fg = [CuNative]::GetForegroundWindow()
   $apps = New-Object System.Collections.ArrayList
-  $procs = Get-Process -ErrorAction SilentlyContinue | Where-Object {
-    $_.MainWindowHandle -ne [IntPtr]::Zero -and -not [string]::IsNullOrWhiteSpace($_.MainWindowTitle)
-  } | Sort-Object MainWindowTitle
-  $fgPid = [uint32]0
-  if ($fg -ne [IntPtr]::Zero) { [void][CuNative]::GetWindowThreadProcessId($fg, [ref]$fgPid) }
-  foreach ($p in $procs) {
+  $windows = @([CuNative]::ListVisibleWindows() | Sort-Object Title)
+  foreach ($w in $windows) {
+    $p = Get-Process -Id ([int]$w.Pid) -ErrorAction SilentlyContinue
+    if (-not $p) { continue }
     [void]$apps.Add([pscustomobject]@{
-      hwnd = $p.MainWindowHandle.ToInt64()
-      pid = $p.Id
+      hwnd = [int64]$w.Hwnd
+      pid = [int]$w.Pid
       app = $p.ProcessName
-      title = $p.MainWindowTitle
-      foreground = ($fgPid -eq $p.Id)
+      title = [string]$w.Title
+      foreground = ($fg.ToInt64() -eq [int64]$w.Hwnd)
     })
   }
   return @{ ok = $true; apps = @($apps); count = $apps.Count }
@@ -1150,6 +1193,7 @@ function Invoke-Action($params) {
   $root = Get-AutomationRoot $hwnd
 
   $rect = Get-WindowRectArr $hwnd
+  if ($null -eq $rect -or $rect.width -le 0 -or $rect.height -le 0) { Fail 'target window has no actionable bounds' }
   $fg = [CuNative]::GetForegroundWindow()
 
   # Bring target forward: official Codex Windows operates the foreground app.
@@ -1187,6 +1231,7 @@ function Invoke-Action($params) {
     'click' {
       $button = if ($params.mouse_button) { [string]$params.mouse_button } else { 'left' }
       $count = if ($null -ne $params.click_count) { [int]$params.click_count } else { 1 }
+      if ($count -lt 1 -or $count -gt 3) { Fail 'click_count must be between 1 and 3' }
       if ($element) {
         $invoke = $null
         $r = $element.Current.BoundingRectangle
@@ -1208,6 +1253,9 @@ function Invoke-Action($params) {
         return @{ ok = $true; via = 'coordinate'; x = $pt.x; y = $pt.y }
       }
       $x = [double]$params.x; $y = [double]$params.y
+      if ($x -lt 0 -or $y -lt 0 -or $x -ge $rect.width -or $y -ge $rect.height) {
+        Fail "click coordinate ($x, $y) is outside the latest window bounds $($rect.width)x$($rect.height)"
+      }
       $pt = & $toScreen $x $y
       Invoke-ClickAt $pt.x $pt.y $button $count
       return @{ ok = $true; via = 'coordinate'; x = $pt.x; y = $pt.y }
@@ -1299,28 +1347,29 @@ function Invoke-Action($params) {
     }
 
     'scroll' {
-      if ($element) {
-        try {
-          $sp = $element.GetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern)
-          $sp.ScrollIntoView()
-          return @{ ok = $true; via = 'ScrollItemPattern.ScrollIntoView' }
-        } catch {}
-      }
       $direction = [string]$params.direction
       $pages = if ($null -ne $params.pages) { [double]$params.pages } else { 1.0 }
-      $amount = [int](120 * $pages)
+      if ($pages -le 0 -or $pages -gt 10 -or [double]::IsNaN($pages) -or [double]::IsInfinity($pages)) {
+        Fail 'scroll pages must be greater than 0 and at most 10'
+      }
+      # One page ≈ 12 notches (12 × WHEEL_DELTA ≈ two thirds of a viewport at
+      # default Chrome line height); fractional pages scale the notch count.
+      $notches = [Math]::Max(1, [int][Math]::Round(12 * $pages))
       if ($element) {
         $r = $element.Current.BoundingRectangle
         $pt = & $toScreen ([int]($r.X - $rect.x) + [int]($r.Width / 2)) ([int]($r.Y - $rect.y) + [int]($r.Height / 2))
-        Invoke-Scroll $pt.x $pt.y $direction $amount
+        Invoke-Scroll $pt.x $pt.y $direction $notches
         return @{ ok = $true; via = 'mouse wheel'; direction = $direction; pages = $pages; x = $pt.x; y = $pt.y }
       } else {
         if ($null -ne $params.x -and $null -ne $params.y) {
+          if ([double]$params.x -lt 0 -or [double]$params.y -lt 0 -or [double]$params.x -ge $rect.width -or [double]$params.y -ge $rect.height) {
+            Fail "scroll coordinate ($($params.x), $($params.y)) is outside the latest window bounds $($rect.width)x$($rect.height)"
+          }
           $pt = & $toScreen ([double]$params.x) ([double]$params.y)
         } else {
           $pt = & $toScreen ([double]$rect.width / 2) ([double]$rect.height / 2)
         }
-        Invoke-Scroll $pt.x $pt.y $direction $amount
+        Invoke-Scroll $pt.x $pt.y $direction $notches
         return @{ ok = $true; via = 'mouse wheel'; direction = $direction; pages = $pages; x = $pt.x; y = $pt.y }
       }
     }

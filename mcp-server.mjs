@@ -7,16 +7,18 @@
 //
 // Env: CU_APPROVAL=1 enforces approval gating (default off: the MCP host gates),
 //     CU_MAX_DEPTH / CU_MAX_NODES tune the UIA capture budget.
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Config } from './lib/index.js';
 import { buildTools, stopOverlay } from './lib/tools.js';
 import { ComputerUseSession } from './lib/session.js';
 import { setAuditEnabled } from './lib/audit.js';
+import { stopPowerShellKernel } from './lib/ps1.js';
 
-const SESSION_FILE = join(tmpdir(), 'dsh-cu-mcp-session.json');
-const SHOT_FILE = join(tmpdir(), 'dsh-cu-last-shot.png');
+const SESSION_FILE = process.env.CU_SESSION_FILE || join(tmpdir(), 'dsh-cu-mcp-session.json');
+const SHOT_FILE = process.env.CU_SCREENSHOT_FILE || join(tmpdir(), 'dsh-cu-last-shot.png');
+const PACKAGE_VERSION = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
 
 const images = new Map();   // attachmentId -> base64 png
 let imageSeq = 0;
@@ -60,6 +62,7 @@ const registered = buildTools(ctx, session, config);
 const byName = new Map(registered.map((t) => [t.name, t]));
 process.on('exit', () => {
   stopOverlay();
+  stopPowerShellKernel();
 });
 
 const INPUT_SCHEMAS = {
@@ -73,7 +76,7 @@ const INPUT_SCHEMAS = {
       marker: { type: 'string', description: 'Marker id from the numbered crosshair grid on the latest get_app_state screenshot (e.g. "D6"); snaps to the containing element center. Takes priority over element_index and x/y' },
       x: { type: 'number', description: 'X in screenshot pixels' },
       y: { type: 'number', description: 'Y in screenshot pixels' },
-      click_count: { type: 'integer' },
+      click_count: { type: 'integer', minimum: 1, maximum: 3 },
       mouse_button: { type: 'string', enum: ['left', 'right', 'middle'] },
     },
   },
@@ -91,7 +94,7 @@ const INPUT_SCHEMAS = {
     type: 'object', required: ['app', 'direction'],
     properties: {
       app: { type: 'string' }, direction: { type: 'string', enum: ['up', 'down', 'left', 'right'] },
-      element_index: { type: 'integer' }, pages: { type: 'number' }, x: { type: 'number' }, y: { type: 'number' },
+      element_index: { type: 'integer' }, pages: { type: 'number', exclusiveMinimum: 0, maximum: 10 }, x: { type: 'number' }, y: { type: 'number' },
     },
   },
   drag: { type: 'object', required: ['app', 'from_x', 'from_y', 'to_x', 'to_y'], properties: { app: { type: 'string' }, from_x: { type: 'number' }, from_y: { type: 'number' }, to_x: { type: 'number' }, to_y: { type: 'number' } } },
@@ -104,14 +107,18 @@ function persistSession() {
     const s = session;
     if (!s) return;
     const state = s.state ? { ...s.state, screenshot: undefined } : null;   // drop the megabyte base64
-    writeFileSync(SESSION_FILE, JSON.stringify({
+    const temporary = `${SESSION_FILE}.${process.pid}.tmp`;
+    writeFileSync(temporary, JSON.stringify({
       state,
+      stateApp: s.stateApp,
+      observationRequired: s.observationRequired,
       lastScreenPoint: s.lastScreenPoint,
       lastAction: s.lastAction,
       trail: s.trail,
       modelScale: s.modelScale,
       markers: s.markers ?? [],
     }));
+    renameSync(temporary, SESSION_FILE);
   } catch { /* session persistence is best-effort */ }
 }
 
@@ -120,6 +127,8 @@ function restoreSession() {
     if (!existsSync(SESSION_FILE) || !session) return;
     const saved = JSON.parse(readFileSync(SESSION_FILE, 'utf8'));
     session.state = saved.state ?? null;
+    session.stateApp = saved.stateApp ?? null;
+    session.observationRequired = saved.observationRequired === true;
     session.lastScreenPoint = saved.lastScreenPoint ?? null;
     session.lastAction = saved.lastAction ?? null;
     session.trail = saved.trail ?? [];
@@ -166,7 +175,7 @@ async function handle(req) {
     return reply({
       protocolVersion: '2024-11-05',
       capabilities: { tools: {} },
-      serverInfo: { name: 'dsh-computer-use', version: '1.0.0' },
+      serverInfo: { name: 'dsh-computer-use', version: PACKAGE_VERSION },
     });
   }
   if (method === 'notifications/initialized' || method === 'notifications/cancelled') return;
@@ -190,16 +199,29 @@ async function handle(req) {
     try {
       const args = params.arguments ?? {};
       const result = await tool.execute(args, {});
-      persistSession();
       return reply({ content: contentFor(name, args, result), isError: result?.isError === true });
     } catch (error) {
       return reply({ content: [{ type: 'text', text: String(error?.message ?? error) }], isError: true });
+    } finally {
+      // Failed mutations also invalidate the snapshot; persist that state so a
+      // one-shot caller cannot accidentally resume from a stale observation.
+      persistSession();
     }
   }
   process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32601, message: `method not found: ${method}` } })}\n`);
 }
 
 let buffer = '';
+let requestChain = Promise.resolve();
+
+function enqueue(req) {
+  requestChain = requestChain
+    .then(() => handle(req))
+    .catch((error) => {
+      process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: req.id ?? null, error: { code: -32603, message: String(error?.message ?? error) } })}\n`);
+    });
+}
+
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', (chunk) => {
   buffer += chunk;
@@ -213,12 +235,15 @@ process.stdin.on('data', (chunk) => {
       process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'parse error' } })}\n`);
       continue;
     }
-    handle(req).catch((error) => {
-      process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: req.id ?? null, error: { code: -32603, message: String(error?.message ?? error) } })}\n`);
-    });
+    enqueue(req);
   }
 });
-process.stdin.on('end', () => {
+process.stdin.on('end', async () => {
+  // stdio clients commonly close input immediately after sending a one-shot
+  // request. Wait for the queued action and its reply before exiting.
+  await requestChain;
   persistSession();
+  stopOverlay();
+  stopPowerShellKernel();
   process.exit(0);
 });

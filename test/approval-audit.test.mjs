@@ -35,7 +35,17 @@ async function waitForAudit(pred, timeoutMs = 3000) {
 
 const build = (approvalService) => {
   const ctx = { get: (name) => (name === 'approval' ? approvalService : null) };
-  const tools = buildTools(ctx, { lastScreenPoint: null, recordAction() {}, elementScreenPoint: () => null, toScreenPoint: () => null, requireElement: () => { throw new Error('no session'); }, windowScreenPoint: () => null }, { askBeforeActions: true, fx: { overlay: false } });
+  const tools = buildTools(ctx, {
+    state: null,
+    lastScreenPoint: null,
+    requireReady() {},
+    invalidate() {},
+    recordAction() {},
+    elementScreenPoint: () => null,
+    toScreenPoint: () => null,
+    requireElement: () => { throw new Error('no session'); },
+    windowScreenPoint: () => null,
+  }, { askBeforeActions: true, fx: { overlay: false } });
   return Object.fromEntries(tools.map((t) => [t.name, t]));
 };
 
@@ -100,7 +110,17 @@ const build = (approvalService) => {
 {
   const ctx = { get: () => null };
   const tools = Object.fromEntries(
-    buildTools(ctx, { lastScreenPoint: null, recordAction() {}, elementScreenPoint: () => null, toScreenPoint: () => null, requireElement: () => { throw new Error('no session'); }, windowScreenPoint: () => null }, { askBeforeActions: false, fx: { overlay: false } })
+    buildTools(ctx, {
+      state: null,
+      lastScreenPoint: null,
+      requireReady() {},
+      invalidate() {},
+      recordAction() {},
+      elementScreenPoint: () => null,
+      toScreenPoint: () => null,
+      requireElement: () => { throw new Error('no session'); },
+      windowScreenPoint: () => null,
+    }, { askBeforeActions: false, fx: { overlay: false } })
       .map((t) => [t.name, t]),
   );
   let threw = '';

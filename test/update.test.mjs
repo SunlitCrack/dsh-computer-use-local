@@ -13,7 +13,7 @@ const check = (name, ok, detail = '') => {
 };
 
 // --- compareVersions ---------------------------------------------------------
-check('compareVersions equal cores', compareVersions('0.1.0', '0.1.0') === 0);
+check('compareVersions equal cores', compareVersions('0.2.0', '0.2.0') === 0);
 check('compareVersions newer major', compareVersions('1.0.0', '0.9.9') > 0);
 check('compareVersions newer minor', compareVersions('0.2.0', '0.1.9') > 0);
 check('compareVersions newer patch', compareVersions('0.1.2', '0.1.1') > 0);
@@ -33,7 +33,8 @@ const now = 1_000_000_000_000;
 
 await checkPluginUpdate(logger, { fetchImpl, stateFile, now });
 check('first run with newer remote warns once', warns.length === 1, warns[0] ?? 'no warning');
-check('warning mentions package and versions', /@milkuovo\/dsh-computer-use 0\.1\.0 → 9\.9\.9/.test(warns[0] ?? ''), warns[0]);
+const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+check('warning mentions package and versions', new RegExp(`@milkuovo/dsh-computer-use ${pkg.version.replace(/\./g, '\\.')} → 9\\.9\\.9`).test(warns[0] ?? ''), warns[0]);
 const state1 = JSON.parse(readFileSync(stateFile, 'utf8'));
 check('state records seenVersion and lastChecked', state1.seenVersion === '9.9.9' && state1.lastChecked === now);
 
@@ -47,7 +48,7 @@ check('newer release still throttled by 24h window', warns.length === 1);
 await checkPluginUpdate(logger, { fetchImpl, stateFile, now: now + 24 * 3600_000 + 1 });
 check('next day with newer release warns again', warns.length === 2, warns[1] ?? '');
 
-remoteVersion = '0.1.0';
+remoteVersion = '0.2.0';
 await checkPluginUpdate(logger, { fetchImpl, stateFile, now: now + 2 * 24 * 3600_000 });
 check('remote not newer is silent', warns.length === 2);
 

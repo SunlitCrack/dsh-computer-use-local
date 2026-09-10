@@ -67,8 +67,12 @@ const tools = Object.fromEntries(buildTools(ctx, session, {
 }).map((t) => [t.name, t]));
 const app = String(hit.pid);
 
-// Clear the display first (Escape also lets the kernel activate the window).
-try { await tools.press_key.execute({ app, key: 'Escape' }, {}); } catch { /* best-effort */ }
+// Clear the display first. Actions are observation-gated, so take a snapshot
+// before Escape and then observe again for the actual marker test.
+try {
+  await tools.get_app_state.execute({ app }, {});
+  await tools.press_key.execute({ app, key: 'Escape' }, {});
+} catch { /* best-effort */ }
 
 // --- A) get_app_state: markers --------------------------------------------------
 const st = await tools.get_app_state.execute({ app }, {});

@@ -6,6 +6,8 @@
 - **截图 + 无障碍树双模态**：`get_app_state` 返回 UIA 树（扁平 `element_index`，遍历序）+ 窗口截图（作为 image attachment 直接进入模型视觉上下文；DeepSeek adapter 会把工具结果图片发给 vision 模型）
 - **树文本带坐标**：每个元素行末尾带 `frame=[x,y,w,h]`；附件管线降采样时 JS 会把 frame 重缩放到附件像素空间（`modelScale`）——树坐标、截图、`click/scroll/drag` 坐标三者始终同一空间，树命中的元素可直接按 frame 中心点击，无需再对照截图
 - **element_index 第一公民**：动作优先按索引寻址（Invoke/Value/Text 等 UIA pattern），坐标（截图像素）只是兜底；坐标换算链为 模型附件像素 ×(1/modelScale) → 窗口相对像素 → 窗口 bounds → 屏幕像素
+- **强制观察—动作—验证闭环**：每个动作尝试后快照立即失效并返回 `observationRequired: true`；下一动作若未重新 `get_app_state` 会被拒绝，避免旧索引、旧坐标、旧焦点误操作其他窗口
+- **精确窗口绑定**：支持进程名/标题片段、`pid:<number>`、`hwnd:<number>` 与裸数字（PID 优先、HWND 回退）；动作始终绑定最近一次快照的 HWND，多窗口应用不会因主窗口切换而串窗
 - **动效按交互时序播放**：
   - 桌面软件光标（`overlay.ps1`）：click-through 顶层透明窗（WS_EX_TRANSPARENT|NOACTIVATE，SW_SHOWNOACTIVATE，显示后还原前台），沿 cubic 路径运动；路径进度使用 `response=1.4s, damping=0.9, dt=1/240` 的固定步长 spring 推进；**箭头按 DPI 缩放（左上尖端精确锚定交互点），涟漪/雾圈画在尖端**；动作期间屏幕四周亮起蓝色呼吸光带（高眼提示）
   - **常驻会话**：overlay 跨动作存活——光标停在上一动作终点、蓝光持续呼吸，直到回合结束（`agent/status` idle）、空闲 12s、或插件卸载才淡出回收；进程死亡/断流时 EOF 兜底自动还原光标
@@ -48,7 +50,9 @@ npx @milkuovo/dsh-computer-use   # 或本地: node mcp-server.mjs
 
 `dsh-computer-use-mcp`（源码 `mcp-server.mjs`，零依赖）暴露同样的 10 个工具（`element_index` 为 integer）。单次调用即用即退，元素快照持久化在 `%TEMP%\dsh-cu-mcp-session.json`，跨进程仍可按 `element_index` / `marker` 寻址；截图写入 `%TEMP%\dsh-cu-last-shot.png`。默认不启用审批门（由 MCP 宿主把关），`CU_APPROVAL=1` 可强制 fail-closed 审批；`CU_MAX_DEPTH` / `CU_MAX_NODES` 调整树捕获预算。
 
-真实任务示例（一步步 MCP 调用）：`list_apps` → `get_app_state` → `press_key ctrl+t` → `type_text` → `press_key Return` → `get_app_state` 找元素 → `click element_index` → `get_app_state` 验证。
+真实任务示例（一步步 MCP 调用）：`list_apps` → `get_app_state` → `press_key ctrl+t` → `get_app_state` → `type_text` → `get_app_state` → `press_key Return` → `get_app_state` 找元素 → `click element_index` → `get_app_state` 验证。每个动作之间都重新观察，MCP 服务也会强制执行这条规则。
+
+MCP 的跨进程快照默认保存在临时目录；并行使用多个 MCP 客户端时，用 `CU_SESSION_FILE` 为每个客户端指定独立状态文件，`CU_SCREENSHOT_FILE` 可指定截图落盘位置。
 
 ## 配置（cordis.patch.yml）
 
@@ -76,11 +80,11 @@ npx @milkuovo/dsh-computer-use   # 或本地: node mcp-server.mjs
 
 ## 模型使用约定
 
-1. 先 `list_apps` 发现应用，或直接用进程名/PID/窗口标题片段
+1. 先 `list_apps` 发现应用，或直接用进程名、窗口标题片段、`pid:<number>` / `hwnd:<number>`；`list_apps` 会列出同一进程的多个可见顶层窗口
 2. 每次与 app 交互前调用 `get_app_state({app})` —— 返回带编号的树（每行带 `frame=[x,y,w,h]`）+ 截图，头注声明坐标空间
 3. 动作优先 `element_index`；坐标模式使用截图像素 —— 树行 `frame` 中心 `[x+w/2, y+h/2]` 就是合法点击坐标，与截图读点同一空间
 4. **网格标记点选**：截图上画有编号十字准星网格（A1.. 列行标号；未被覆盖的可交互元素在中心补 `E1..`），视觉定位只需回答"目标在哪个标记上"，`click({marker: 'D6'})` 把标记映射回坐标并 UIA 吸附到所在最小可交互元素中心 —— 比直接回归像素坐标稳得多；无标记区域才用 x/y（`marker` 优先级高于 `element_index` / `x/y`）
-5. **落点自证**：每次动作后 `get_app_state` 的截图会用琥珀色圆环标出上一次动作的实际落点，据此确认动作是否生效
+5. **落点自证 + 强制复查**：每次动作后返回 `observationRequired: true`，必须重新调用 `get_app_state`；新截图会用琥珀色圆环标出上一次动作的实际落点，据此确认动作是否生效
 6. **观察即激活**：截图是抓屏实现，`get_app_state` 默认先把目标窗口带到前台（`annotate.activate: false` 关闭），否则拍到的是遮挡物
 7. `press_key` 用 xdotool 语法：`a`、`Return`、`Tab`、`super+c`(Ctrl+C)、`Up`、`Page_Up`、`F5`
 
@@ -94,7 +98,7 @@ npx @milkuovo/dsh-computer-use   # 或本地: node mcp-server.mjs
                      lib/overlay.ps1 ──> 桌面软件光标动画（fx 引擎）
 ```
 
-- `uia.ps1`：窗口解析（进程名/PID/HWND/标题）→ `AutomationElement.FromHandle` → 广度遍历出扁平树（index/path/role/name/value/patterns/settable/frame）→ System.Drawing 截窗口 PNG → fx 叠加 → base64
+- `uia.ps1`：窗口解析（进程名/PID/HWND/标题）→ `AutomationElement.FromHandle` → 受 `maxNodes` 访问预算约束的广度遍历（包含不可见中间节点，避免 UIA 大树失控）→ 扁平树（index/path/role/name/value/patterns/settable/frame）→ System.Drawing 截窗口 PNG → fx 叠加 → base64
 - `get_app_state` 成功后：截图经 `ctx.attachments.saveImages` 持久化，render 输出 `[{text: 树}, {image: 截图}]`；默认截图保持原始画面，调试时才可显式开启合成效果
 - **坐标空间统一**：内核输出的树 frame 是窗口相对物理像素（= 截图捕获空间）。DSH 附件管线可能降采样截图（≤2048px + 字节上限），工具层以附件 ref 的宽高算出 `modelScale`，把树 frame 与模型点击坐标统一到**附件像素空间**；MCP 模式无降采样（从 PNG IHDR 读原生尺寸，scale=1）
 - 指针型动作统一走 `withPointerMotion`：从 session 上一终点规划路径 → 等待 overlay 到位 → 启动真实动作并提交视觉反馈 → 成功后记录新终点；`press_key` / `type_text` 不触发光标
@@ -112,6 +116,14 @@ npx @milkuovo/dsh-computer-use   # 或本地: node mcp-server.mjs
 - Windows 前台语义：动作自动激活目标窗口（前台应用模型）
 - `select_text` 为 best-effort：TextPattern 可用时 Select，否则聚焦元素
 - UIA 内核常驻（首个调用含 ~0.9s 冷启动，之后每请求 ~60ms；空闲 120s 回收）
+
+## 测试
+
+```sh
+npm test                  # 无需预先打开应用的默认逻辑/协议测试
+npm run test:integration  # 需要按用例提示打开 Calculator / 编辑器窗口
+npm run test:e2e          # 自动拉起浏览器与记事本，覆盖完整工具面
+```
 
 ## License
 
