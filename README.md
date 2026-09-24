@@ -20,6 +20,7 @@
 - **审批**：`askBeforeActions`（**默认关**，动作直接执行）。开启后经 `ctx.approval` 逐动作询问；fail-closed——无审批通道（无 agent 上下文或审批服务未注册）时变更类动作直接拒绝
 - **审计**：默认开启，元数据 JSONL 追加到 `~/.dsh-computer-use/audit/computer-use.jsonl`（方法名、app 哈希、字节量、outcome、耗时、via；**不含参数与内容**）
 - **更新提醒**（`updateCheck`，默认开）：插件启动时非阻塞查询 npm registry（官方源；若 shell 配置了 `npm_config_registry` 镜像则跟随），发现新版本通过 logger 提醒——同一版本只提醒一次、同一自然日最多一次，离线/registry 错误时完全静默
+- **官方 computer-use 契约**（0.3.0+）：DSH 0.1.7+ 装有 `@deepseek-ai/dsh-computer-use` 注册表时，以 `mimi-computer-use` 认领唯一提供方席位；席位被其他提供方（如官方 cua-driver）占用时自动让位（撤下工具与提示词并告警），避免双开桌面工具。注册表缺席时行为不变；零新增依赖（按服务名探测，不导入官方包）。
 - **真光标让位**：动画期与真实输入期用 `SetSystemCursor` 全局隐藏真光标（软件光标是唯一指针），结束后 `SPI_SETCURSORS` 还原用户光标方案，且真光标位置原样归还；JS 侧对进程异常死亡有还原 failsafe
 - **零运行时依赖**：Node 侧只 import `@deepseek-ai/schemastery` / `@deepseek-ai/dsh-tools`；UIA 内核是单文件 PowerShell 5.1（`--serve` 常驻进程，stdin/stdout JSON 行协议，空闲 120s / 200 次请求后回收，崩溃自动重启）
 

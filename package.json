@@ -1,7 +1,7 @@
 {
   "name": "@milkuovo/dsh-computer-use",
-  "version": "0.2.2",
-  "description": "Codex Computer Use for DeepSeek Harness on Windows: screenshot + UI Automation tree + mouse/keyboard actions, aligned with the official 10-method Codex Computer Use tool surface. Includes a zero-dependency stdio MCP server.",
+  "version": "0.3.0",
+  "description": "Codex Computer Use for DeepSeek Harness on Windows: screenshot + UI Automation tree + mouse/keyboard actions, aligned with the official 10-method Codex Computer Use tool surface. Registers as the exclusive provider on the official DSH 0.1.7+ computer-use seam when present. Includes a zero-dependency stdio MCP server.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -15,7 +15,7 @@
     "dsh-computer-use-mcp": "./mcp-server.mjs"
   },
   "scripts": {
-    "test": "node scripts/logic-test.mjs && node --test test/session.test.mjs test/approval-audit.test.mjs test/duplicate-guard.test.mjs test/cancellation.test.mjs test/kernel-safety.test.mjs test/mcp-stdio.test.mjs test/update.test.mjs",
+    "test": "node scripts/logic-test.mjs && node --test test/session.test.mjs test/approval-audit.test.mjs test/duplicate-guard.test.mjs test/seam.test.mjs test/cancellation.test.mjs test/kernel-safety.test.mjs test/mcp-stdio.test.mjs test/update.test.mjs",
     "test:integration": "node --test test/annotate.test.mjs test/cursor-return.test.mjs test/overlay-session.test.mjs test/tree-frames.test.mjs",
     "test:e2e": "node scripts/tool-surface-e2e.mjs"
   },
