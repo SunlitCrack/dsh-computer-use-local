@@ -73,21 +73,22 @@ function makeHarness({ seam, promptSections } = {}) {
   };
 }
 
-function unload(harness) {
-  for (const cleanup of harness.cleanups.reverse()) cleanup();
+// Cleanup is async since 0.3.1: the seam disposal is awaited, so unload must be too.
+async function unload(harness) {
+  for (const cleanup of harness.cleanups.reverse()) await cleanup();
   harness.cleanups.length = 0;
 }
 
-test('without the seam the ten tools register directly', () => {
+test('without the seam the ten tools register directly', async () => {
   const h = makeHarness();
   apply(h.ctx, CONFIG);
   assert.equal(h.names.length, 10);
   assert.deepEqual(h.sections, ['tool:computer-use']);
-  unload(h);
+  await unload(h);
   assert.equal(h.names.length, 0);
 });
 
-test('a free seam slot is claimed and released on unload', () => {
+test('a free seam slot is claimed and released on unload', async () => {
   const seam = makeSeam(undefined);
   const h = makeHarness({ seam });
   apply(h.ctx, CONFIG);
@@ -96,12 +97,12 @@ test('a free seam slot is claimed and released on unload', () => {
   // The late-arrival watch stays idempotent once the slot is ours.
   h.fireInject();
   assert.equal(seam.registration, 'mimi-computer-use');
-  unload(h);
+  await unload(h);
   assert.equal(seam.registration, undefined);
   assert.equal(h.names.length, 0);
 });
 
-test('a seam slot held by another provider stands the tools down', () => {
+test('a seam slot held by another provider stands the tools down', async () => {
   const seam = makeSeam('cua-driver-native');
   const h = makeHarness({ seam });
   apply(h.ctx, CONFIG);
@@ -109,10 +110,10 @@ test('a seam slot held by another provider stands the tools down', () => {
   assert.deepEqual(h.sections, []);
   assert.equal(h.warnings.length, 1);
   assert.match(h.warnings[0], /cua-driver-native/);
-  unload(h);
+  await unload(h);
 });
 
-test('a late seam whose slot is taken removes the already-registered tools', () => {
+test('a late seam whose slot is taken removes the already-registered tools', async () => {
   const h = makeHarness();
   apply(h.ctx, CONFIG);
   assert.equal(h.names.length, 10);
@@ -122,16 +123,16 @@ test('a late seam whose slot is taken removes the already-registered tools', () 
   assert.equal(h.names.length, 0);
   assert.deepEqual(h.sections, []);
   assert.equal(h.warnings.length, 1);
-  unload(h);
+  await unload(h);
 });
 
-test('a late seam with a free slot is claimed without disturbing the tools', () => {
+test('a late seam with a free slot is claimed without disturbing the tools', async () => {
   const h = makeHarness();
   apply(h.ctx, CONFIG);
   const seam = makeSeam(undefined);
   h.fireInject({ computerUse: seam });
   assert.equal(seam.registration, 'mimi-computer-use');
   assert.equal(h.names.length, 10);
-  unload(h);
+  await unload(h);
   assert.equal(seam.registration, undefined);
 });

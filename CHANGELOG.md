@@ -1,5 +1,14 @@
 # 更新记录
 
+## 0.3.1 — 2026-09-29
+
+- `peerDependencies` 的 `@deepseek-ai/dsh-tools` 由 `^0.1.2-rc.1` 放宽为 `>=0.1.2-rc.1 <0.3.0-0`。原范围上界是 `<0.2.0-0`，在 DSH 0.2.0 系列上不满足，DSH 官方兼容性闸门会判定不兼容并直接跳过本插件，导致内置 Computer Use 整体失效（10 个工具全部不注册）。实测修改前 0.2.0-rc.1/rc.2 判定拒绝，修改后 0.1.7-rc.1、0.1.7-rc.2、0.2.0-rc.1、0.2.0-rc.2 全部兼容。
+- 上界由 `<0.3.0` 收紧为 `<0.3.0-0`：闸门用 `includePrerelease` 语义求值，`<0.3.0` 连 `0.3.0-rc.x` 也放行，等于对未来 0.3 预发布宣称兼容；`<0.3.0-0` 把 0.3.0 的全部预发布挡在外面。
+- seam 释放改为异步等待：官方契约 `register(name)` 的 disposer 类型是 `() => Promise<void>`（内部是 cordis effect），`lib/index.js` 的卸载清理改为 `async` 并 `await releaseSeam()`，等注册表真正记录释放后再继续后续清理（cordis 会 await 返回 Promise 的 cleanup）。
+- 无运行时行为变更：`lib/tools.js` 对 `@deepseek-ai/dsh-tools` 的 `defineTool` 导入经核对在 0.2.0-rc.1 与 0.2.0-rc.2 均仍导出，工具注册路径不受影响。
+
+验证：闸门逐版本核对通过；`npm test` 43 项全过（`test/seam.test.mjs` 的 `unload` 随异步 cleanup 改为 `await`）；对 profile 实际安装产物运行集成校验，输出 10 个唯一 Computer Use 工具；DSH 0.2.0-rc.1/rc.2 桌面 runtime 实机重载后 10 个工具在线且插件不再被跳过。
+
 ## 0.3.0 — 2026-09-24
 
 - 接入 DSH 0.1.7+ 官方 computer-use 契约（`@deepseek-ai/dsh-computer-use` 的 `computerUse` 服务）：注册表存在时以 `mimi-computer-use` 认领独占提供方席位，本插件的 10 个工具成为该部署唯一的桌面操作来源；席位已被其他提供方（如官方 cua-driver）占用时自动让位——撤下工具与系统提示词并记录告警，不再与官方提供方双开桌面工具。注册表缺席（DSH ≤ 0.1.6 或未安装契约包）时行为与 0.2.2 完全一致；注册表在启动后期才挂载时同样完成认领或让位。卸载顺序遵循官方契约：先撤工具与资源、再释放席位。
