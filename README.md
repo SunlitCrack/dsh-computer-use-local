@@ -1,5 +1,12 @@
 # dsh-computer-use
 
+> **Local line（`0.3.1-local.1`）** — 本仓库是 `mekos2772/dsh-computer-use` 0.3.1 的独立维护线，
+> 修掉了在中文 locale Windows 上实测出的 5 个缺陷：stdin/标题编码、元素按位置路径寻址会点到邻居、
+> 激活后 UIA root 作废、click 回执坐标口径、同名进程窗口二义。
+> 改动清单见 [LOCAL-PATCHES.md](./LOCAL-PATCHES.md)，撤销的上游报告原文见 [UPSTREAM-ISSUE.md](./UPSTREAM-ISSUE.md)，
+> 回归用例 `node scripts/local-verify.mjs`（6/6）。包名沿用 `@milkuovo/dsh-computer-use`，
+> 这样 profile 里的 `cordis.patch.yml` 与上游补丁仍可直接套用。
+
 面向 DeepSeek Harness（DSH）的 **Windows 桌面自动化工具**：截图 + 无障碍树双模态操控鼠标键盘，标准 DSH bundle（cordis 插件 + `defineTool` + `dsh.bundle.patch`），另附零依赖 stdio MCP server。
 
 版本变更见 [CHANGELOG.md](./CHANGELOG.md)。

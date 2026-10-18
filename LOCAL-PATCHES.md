@@ -1,6 +1,6 @@
-# 本地补丁（fork 自 npm `@milkuovo/dsh-computer-use@0.3.1`）
+# 本地补丁（独立维护线，基线 npm `@milkuovo/dsh-computer-use@0.3.1`）
 
-这份 fork 只做一件事：把本机实测到的 5 个缺陷修掉。上游代码结构、工具面（10 个工具）、
+这条独立维护线只做一件事：把本机实测到的 5 个缺陷修掉。上游代码结构、工具面（10 个工具）、
 配置项、cordis 装配方式都没动，所以它仍然是「一个 DSH 插件 + 一份 cordis patch」。
 
 - 基线：git `b85ecf2`（`release: 0.3.1`），npm 0.3.1
@@ -44,7 +44,7 @@ SUMMARY: 6/6 passed
 
 ## 装配（本机 profile）
 
-本 fork 在工作区里，profile 通过 **目录联接** 指向它，改完 JS 让插件重载即可生效；
+本仓库在工作区里，profile 通过 **目录联接** 指向它，改完 JS 让插件重载即可生效；
 `lib/uia.ps1` 的改动需要杀掉常驻 kernel 才重新加载（插件自己只在崩溃/超时/200 次请求后回收）。
 
 ```powershell

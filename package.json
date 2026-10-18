@@ -53,11 +53,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mekos2772/dsh-computer-use.git"
+    "url": "git+https://github.com/SunlitCrack/dsh-computer-use-local.git"
   },
-  "homepage": "https://github.com/mekos2772/dsh-computer-use#readme",
+  "homepage": "https://github.com/SunlitCrack/dsh-computer-use-local#readme",
   "bugs": {
-    "url": "https://github.com/mekos2772/dsh-computer-use/issues"
+    "url": "https://github.com/SunlitCrack/dsh-computer-use-local/issues"
   },
   "author": "mekos2772",
   "license": "MIT"
