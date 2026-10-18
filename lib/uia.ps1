@@ -5,6 +5,11 @@
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
+# LOCAL PATCH P1: stdin was decoded with the console codepage (cp936 on this
+# machine), so the UTF-8 JSON written by the Node side arrived mojibaked and
+# every non-ASCII type_text / set_value payload was corrupted
+# ("验收" -> "楠屾敹"). Only the output side was pinned to UTF-8 upstream.
+try { [Console]::InputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
@@ -45,7 +50,12 @@ public static class CuNative {
   [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lParam);
-  [DllImport("user32.dll")] public static extern int GetWindowTextW(IntPtr hWnd, StringBuilder text, int count);
+  // LOCAL PATCH P2: CharSet.Unicode - without it this StringBuilder is
+  // marshalled as ANSI, so GetWindowTextW's UTF-16 output is read back as
+  // single bytes: non-ASCII titles arrived mojibaked and half length
+  // ("评估 Computer-use ..." -> "膵0O "). GetWindowTextLengthW reports
+  // characters, so the ANSI buffer was also too short for the real text.
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr hWnd, StringBuilder text, int count);
   [DllImport("user32.dll")] public static extern int GetWindowTextLengthW(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
@@ -254,6 +264,8 @@ function Get-ProcessInfo($hwnd) {
 }
 
 function Resolve-Window($target) {
+  # P5: selection metadata for the caller (get_state surfaces it in the tree header).
+  $script:LastWindowPick = $null
   if ($null -ne $target.hwnd -and $target.hwnd -ne 0) {
     $hwnd = [IntPtr]$target.hwnd
     if ([CuNative]::IsWindowVisible($hwnd)) { return $hwnd }
@@ -291,19 +303,58 @@ function Resolve-Window($target) {
     $candidate = [IntPtr]([int64]$app)
     if ([CuNative]::IsWindowVisible($candidate)) { return $candidate }
   }
-  $procs = Get-Process -ErrorAction SilentlyContinue | Where-Object {
-    $_.MainWindowHandle -ne [IntPtr]::Zero -and (
-      $_.ProcessName -eq $app -or $_.ProcessName -eq ($app -replace '\.exe$','')
-    )
+  # LOCAL PATCH P5 (window selection consistent with list_apps).
+  # Upstream resolved a process name through Get-Process + MainWindowHandle and
+  # took $procs[0] -- an ARBITRARY process of that name. With two Explorer
+  # processes, app:'explorer' returned the desktop shell (hwnd 65748, the
+  # "Program Manager" window) instead of any folder window, and a just-launched
+  # app whose MainWindowHandle was not populated yet looked "not found" even
+  # though list_apps had just listed it. Selection now runs over the same
+  # visible-window enumeration list_apps uses, skips the shell desktop windows,
+  # prefers the foreground window, and otherwise takes the largest area.
+  $windows = @([CuNative]::ListVisibleWindows())
+  $needleProcess = $app -replace '\.exe$',''
+  $shellSkipped = 0
+  $candidates = @()
+  foreach ($w in $windows) {
+    if ([string]::IsNullOrWhiteSpace($w.Title) -or $w.Title -eq 'Program Manager') { $shellSkipped++; continue }
+    $pn = ''
+    try { $pn = (Get-Process -Id ([int]$w.Pid) -ErrorAction Stop).ProcessName } catch { continue }
+    if ($pn -eq $needleProcess) { $candidates += [pscustomobject]@{ Hwnd = [IntPtr]$w.Hwnd; Title = [string]$w.Title } }
   }
-  if ($procs) { return $procs[0].MainWindowHandle }
-  # Window-title match. Get-Process is tried first: EnumWindows can be blocked
-  # in sandboxes/jobs, while MainWindowTitle comes from the process table.
-  $byTitle = Get-Process -ErrorAction SilentlyContinue | Where-Object {
-    $_.MainWindowHandle -ne [IntPtr]::Zero -and
-    $_.MainWindowTitle.IndexOf($app, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
-  } | Sort-Object { $_.MainWindowTitle.Length }
-  if ($byTitle) { return $byTitle[0].MainWindowHandle }
+  $pickBy = 'process'
+  if ($candidates.Count -eq 0) {
+    $pickBy = 'title'
+    foreach ($w in $windows) {
+      if ([string]::IsNullOrWhiteSpace($w.Title) -or $w.Title -eq 'Program Manager') { continue }
+      if ($w.Title.IndexOf($app, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        $candidates += [pscustomobject]@{ Hwnd = [IntPtr]$w.Hwnd; Title = [string]$w.Title }
+      }
+    }
+  }
+  if ($candidates.Count -gt 0) {
+    $chosen = $null
+    foreach ($c in $candidates) {
+      if ([IntPtr]$c.Hwnd -eq $fg) { $chosen = $c; break }
+    }
+    if ($null -eq $chosen) {
+      $bestArea = -1
+      foreach ($c in $candidates) {
+        $r = Get-WindowRectArr $c.Hwnd
+        $area = if ($r) { [int64]$r.width * [int64]$r.height } else { 0 }
+        if ($area -gt $bestArea) { $bestArea = $area; $chosen = $c }
+      }
+    }
+    $script:LastWindowPick = @{
+      by = $pickBy
+      candidates = $candidates.Count
+      ambiguous = ($candidates.Count -gt 1)
+      foreground = ($chosen -and ([IntPtr]$chosen.Hwnd -eq $fg))
+      title = if ($chosen) { [string]$chosen.Title } else { '' }
+    }
+    return [IntPtr]$chosen.Hwnd
+  }
+  $script:LastWindowPick = @{ by = 'none'; candidates = 0; ambiguous = $false; foreground = $false; title = '' }
   $found = [CuNative]::FindByTitle($app)
   if ($found -ne [IntPtr]::Zero) { return $found }
   return $null
@@ -317,6 +368,63 @@ function Resolve-ElementByPath($root, $path) {
     $current = $children[$seg]
   }
   return $current
+}
+
+# LOCAL PATCH P3 (identity check for element paths).
+# A path is a list of CHILD ORDINALS, so it is only valid while the tree keeps
+# the same shape. Explorer/Chromium re-render and re-order siblings between the
+# snapshot and the action, and the path then resolves to a NEIGHBOUR: the call
+# reports success while a different element was clicked (measured: element 46
+# opened the file that the tree printed as 48). Every element reference now
+# carries the identity captured at snapshot time; if the path no longer resolves
+# to it, the element is re-found by AutomationId (strongest) or Name+role, and
+# the receipt reports which route was taken.
+function Get-ElementIdentity($element) {
+  $name = ''
+  $automationId = ''
+  $role = ''
+  try { $name = [string]$element.Current.Name } catch {}
+  try { $automationId = [string]$element.Current.AutomationId } catch {}
+  try {
+    $ct = $element.Current.ControlType
+    if ($ct) { $role = $ct.ProgrammaticName -replace 'ControlType\.','' }
+  } catch {}
+  return @{ name = $name; automationId = $automationId; role = $role }
+}
+
+function Test-ElementIdentity($element, $expected) {
+  if ($null -eq $expected) { return $true }
+  $id = Get-ElementIdentity $element
+  $wantAid = [string]$expected.automationId
+  if (-not [string]::IsNullOrEmpty($wantAid)) {
+    return ($id.automationId -eq $wantAid)
+  }
+  $wantName = [string]$expected.name
+  $wantRole = [string]$expected.role
+  if ($id.name -ne $wantName) { return $false }
+  if (-not [string]::IsNullOrEmpty($wantRole) -and $id.role -ne $wantRole) { return $false }
+  return $true
+}
+
+function Find-ElementByIdentity($root, $expected, $maxNodes) {
+  if ($null -eq $expected) { return $null }
+  $wantAid = [string]$expected.automationId
+  $wantName = [string]$expected.name
+  if ([string]::IsNullOrEmpty($wantAid) -and [string]::IsNullOrEmpty($wantName)) { return $null }
+  $budget = if ($maxNodes -and $maxNodes -gt 0) { $maxNodes } else { 1200 }
+  $visited = 0
+  $queue = New-Object System.Collections.Queue
+  $queue.Enqueue($root)
+  while ($queue.Count -gt 0 -and $visited -lt $budget) {
+    $node = $queue.Dequeue()
+    $visited++
+    if (Test-ElementIdentity $node $expected) { return $node }
+    try {
+      $children = $node.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)
+      foreach ($child in $children) { $queue.Enqueue($child) }
+    } catch {}
+  }
+  return $null
 }
 
 function Get-SecondaryActions($element) {
@@ -1117,7 +1225,7 @@ function Invoke-GetState($params) {
 
   return @{
     ok = $true
-    window = @{ hwnd = $hwnd.ToInt64(); pid = $windowInfo.pid; processName = $windowInfo.processName; title = $winTitle; bounds = $rect; foreground = $isForeground }
+    window = @{ hwnd = $hwnd.ToInt64(); pid = $windowInfo.pid; processName = $windowInfo.processName; title = $winTitle; bounds = $rect; foreground = $isForeground; pick = $script:LastWindowPick }
     elements = $elements
     elementCount = $elements.Count
     nodeCount = $visitedCount
@@ -1194,6 +1302,16 @@ function Invoke-Action($params) {
     if (-not (Activate-Window $hwnd)) {
       Fail "cannot bring window $($hwnd.ToInt64()) to the foreground; action was not sent"
     }
+    # P3b: activation can recreate a provider's elements (Explorer rebuilds its
+    # shell view on foreground change). The root captured above then points at a
+    # dead tree: every path segment resolves to a nameless stale node and the
+    # identity search finds nothing, so a recoverable drift looked fatal.
+    # Re-acquire now that the window really is foreground; keep the previous
+    # root if the provider refuses mid-activation (the Chrome case above).
+    try {
+      $reactivated = Get-AutomationRoot $hwnd
+      if ($null -ne $reactivated) { $root = $reactivated }
+    } catch { }
   }
 
   # screen->screenshot coordinate: params.x/y are screenshot pixels
@@ -1203,6 +1321,7 @@ function Invoke-Action($params) {
   }
 
   $element = $null
+  $elementResolution = $null
   # An explicit path (even the empty one) means "address by element". The empty
   # path is the window root, i.e. element_index 0 -- it used to be dropped by the
   # IsNullOrWhiteSpace guard and silently degraded to a click at window (0,0).
@@ -1215,7 +1334,26 @@ function Invoke-Action($params) {
       $segments = @($pathValue -split '\.' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
     }
     $element = Resolve-ElementByPath $root $segments
-    if ($null -eq $element) { Fail "element path '$pathValue' no longer resolves; call get_app_state again" }
+    # P3: the path is positional; keep the identity the snapshot recorded.
+    $expected = $params.element_identity
+    $maxNodesForSearch = if ($null -ne $params.max_nodes) { [int]$params.max_nodes } else { 1200 }
+    if ($null -eq $element) {
+      if ($null -ne $expected) { $element = Find-ElementByIdentity $root $expected $maxNodesForSearch }
+      if ($null -eq $element) { Fail "element path '$pathValue' no longer resolves; call get_app_state again" }
+      $elementResolution = 'identity-recovered'
+    } elseif (-not (Test-ElementIdentity $element $expected)) {
+      $drifted = Get-ElementIdentity $element
+      $recovered = Find-ElementByIdentity $root $expected $maxNodesForSearch
+      if ($null -eq $recovered) {
+        Fail ("element path '$pathValue' now resolves to a different element " +
+          "(name='$($drifted.name)' id='$($drifted.automationId)') and the snapshot's element is no longer in the tree; " +
+          'call get_app_state again')
+      }
+      $element = $recovered
+      $elementResolution = 'identity-recovered-from-drift'
+    } else {
+      $elementResolution = 'path'
+    }
   }
 
   $script:BorrowCursor = if ($null -eq $params.borrowCursor) { $true } else { [bool]$params.borrowCursor }
@@ -1244,11 +1382,24 @@ function Invoke-Action($params) {
         }
         if ($invoke) {
           $ptS = & $toScreen $elCenter.x $elCenter.y
-          return @{ ok = $true; via = 'InvokePattern'; note = 'clicked element via AX Invoke pattern'; x = $ptS.x; y = $ptS.y }
+          # P4: x/y are reported in the SAME space every other coordinate in this
+          # tool surface uses (window-relative screenshot pixels: tree frames,
+          # markers, click x/y inputs) so the receipt agrees with the amber ring.
+          # Upstream returned SCREEN pixels here, which in a 1301x782 window read
+          # as a point outside the window (measured: "(1259, 860)").
+          $note = 'clicked element via AX Invoke pattern; the pointer did not move'
+          if ($elementResolution -and $elementResolution -ne 'path') {
+            $note += "; element re-found by identity after the snapshot's path drifted ($elementResolution)"
+          }
+          return @{ ok = $true; via = 'InvokePattern'; note = $note; x = [int]$elCenter.x; y = [int]$elCenter.y }
         }
         $pt = & $toScreen $elCenter.x $elCenter.y
         Invoke-ClickAt $pt.x $pt.y $button $count
-        return @{ ok = $true; via = 'coordinate'; x = $pt.x; y = $pt.y }
+        $note = $null
+        if ($elementResolution -and $elementResolution -ne 'path') {
+          $note = "element re-found by identity after the snapshot's path drifted ($elementResolution)"
+        }
+        return @{ ok = $true; via = 'coordinate'; note = $note; x = [int]$elCenter.x; y = [int]$elCenter.y }
       }
       $x = [double]$params.x; $y = [double]$params.y
       if ($x -lt 0 -or $y -lt 0 -or $x -ge $rect.width -or $y -ge $rect.height) {
@@ -1256,12 +1407,15 @@ function Invoke-Action($params) {
       }
       $pt = & $toScreen $x $y
       Invoke-ClickAt $pt.x $pt.y $button $count
-      return @{ ok = $true; via = 'coordinate'; x = $pt.x; y = $pt.y }
+      return @{ ok = $true; via = 'coordinate'; x = [int]$x; y = [int]$y }
     }
 
     'perform_secondary_action' {
       if (-not $element) { Fail 'perform_secondary_action requires element_index' }
       $result = Invoke-SecondaryAction $element ([string]$params.secondary_action)
+      if ($result -is [hashtable] -and $elementResolution -and $elementResolution -ne 'path') {
+        $result.note = (("element re-found by identity after the snapshot's path drifted ($elementResolution); " + [string]$result.note).TrimEnd('; '))
+      }
       return $result
     }
 
