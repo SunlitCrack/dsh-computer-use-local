@@ -72,5 +72,5 @@ Rename-Item "$p.upstream-0.3.1" "dsh-computer-use"
 ## 未做的事
 
 - 没有提交（工作区 dirty，`LOCAL-PATCHES.diff` 是快照）。
-- 没有改版本号：`package.json` 仍是 `0.3.1`，靠本文件区分上游与本地。
+- 版本号已改为 `0.3.1-local.1`（tag 同名），装到机器上能一眼看出是本地线而不是上游 0.3.1。
 - 上游若发布修复，P1/P2/P5 大概会以不同写法落地，届时以 `LOCAL-PATCHES.diff` 逐条比对再决定丢弃哪几条。
