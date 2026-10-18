@@ -31,13 +31,32 @@
 - **真光标让位**：动画期与真实输入期用 `SetSystemCursor` 全局隐藏真光标（软件光标是唯一指针），结束后 `SPI_SETCURSORS` 还原用户光标方案，且真光标位置原样归还；JS 侧对进程异常死亡有还原 failsafe
 - **零运行时依赖**：Node 侧只 import `@deepseek-ai/schemastery` / `@deepseek-ai/dsh-tools`；UIA 内核是单文件 PowerShell 5.1（`--serve` 常驻进程，stdin/stdout JSON 行协议，空闲 120s / 200 次请求后回收，崩溃自动重启）
 
+## 与上游 0.3.1 的差异
+
+**工具面、配置项、装配方式完全不变**（10 个工具、`cordis.patch.yml` 的 insert 行、`dsh.bundle.patch` 都没动），
+所以是可以直接替换本地的 drop-in 版本。代码差异全部记在 [LOCAL-PATCHES.md](./LOCAL-PATCHES.md)，`LOCAL-PATCHES.diff` 是同一份改动的 patch 快照。
+
+| # | 上游行为 | 本线行为 |
+|---|---|---|
+| P1 | `uia.ps1` 只设 `[Console]::OutputEncoding`，stdin 按系统代码页（本机 cp936）解码 → 非 ASCII `type_text`/`set_value` 变乱码（`验收`→`楠屾敹`） | 同时设 `[Console]::InputEncoding = UTF8` |
+| P2 | `GetWindowTextW(..., StringBuilder, int)` 未指定 `CharSet`，UTF-16 被当 ANSI 读回 → `list_apps` 标题乱码且长度减半 | 加 `CharSet = CharSet.Unicode` |
+| P3 | 元素按位置路径（子序号链）寻址；窗口重排后同一路径落到**邻居**上，且调用返回成功 | 快照带元素身份（`AutomationId`/`Name`/`role`），动作前核对；漂移则按身份重找并在回执 `note` 里说明；身份也找不到就明确失败 |
+| P4 | `click` 回执 `x/y` 是屏幕坐标，与树 frame / marker / 入参的窗口相对坐标不一致；`InvokePattern` 路径根本没动光标 | 回执改为窗口相对，`note` 明说「指针没有移动」 |
+| P5 | 进程名解析取 `$procs[0]` → 同名多窗口时返回任意一个（两个 explorer 时返回桌面壳 `Program Manager`） | 与 `list_apps` 同源的可见窗口选择（跳桌面壳 → 前台优先 → 面积最大 → 标题兜底），并回 `window.pick`；多候选在树文本告警 |
+
+另外本线新增：`get_state` 返回 `window.pick`（`by`/`candidates`/`ambiguous`/`foreground`/`title`）；
+`scripts/local-verify.mjs`（6 项回归断言）与 `scripts/local-repro.mjs`（名字解析与索引映射探针）；
+`uia.ps1` 以 UTF-8 with BOM 保存（PowerShell 5.1 对无 BOM 脚本按 ANSI 代码页读，会读坏非 ASCII 文本）。
+版本号 `0.3.1-local.1`，包名仍是 `@milkuovo/dsh-computer-use`（这样 profile 的 insert 行与上游补丁可直接套用）。
+
 ## 安装
 
 ### 作为 DSH 插件（npm）
 
 ```sh
-# 在 profile 目录安装（或 link 本地开发目录）
-npm i @milkuovo/dsh-computer-use        # 或 dsh plugin --profile web add <path>
+# 在 profile 目录安装本仓库（npm 上的 @milkuovo/dsh-computer-use 仍是上游 0.3.1，不含本线修复）
+npm i github:SunlitCrack/dsh-computer-use-local
+# 或：dsh plugin --profile <profile> add SunlitCrack/dsh-computer-use-local
 # 重启 dsh 后生效。设置面板/HMR 改配置：
 #   $DSH_HOME/profiles/<profile>/cordis.patch.yml
 ```
@@ -45,15 +64,16 @@ npm i @milkuovo/dsh-computer-use        # 或 dsh plugin --profile web add <path
 ### 源码方式
 
 ```sh
-git clone https://github.com/mekos2772/dsh-computer-use
-cd dsh-computer-use
+git clone https://github.com/SunlitCrack/dsh-computer-use-local
+cd dsh-computer-use-local
 dsh plugin --profile <profile> add .
 ```
 
 ### 独立 MCP server（任何 MCP 宿主可用）
 
 ```sh
-npx @milkuovo/dsh-computer-use   # 或本地: node mcp-server.mjs
+node mcp-server.mjs               # 本仓库自带，零依赖
+# 或从 fork 前身的上游包：npx @milkuovo/dsh-computer-use（不含本线修复）
 ```
 
 ## MCP 模式
@@ -123,9 +143,26 @@ MCP 的跨进程快照默认保存在临时目录；并行使用多个 MCP 客�
 
 ## 限制
 
-- Windows 前台语义：动作自动激活目标窗口（前台应用模型）
-- `select_text` 为 best-effort：TextPattern 可用时 Select，否则聚焦元素
-- UIA 内核常驻（首个调用含 ~0.9s 冷启动，之后每请求 ~60ms；空闲 120s 回收）
+以下均为本机实测（Windows 10 19045 / PowerShell 5.1 / 1920×1080 @125%），不是照抄设计文档。
+
+- **观测会激活窗口**：`get_state` 默认把目标窗口还原并拉到前台（JS 侧 `annotate.activate !== false`；
+  内核 `Invoke-GetState` 先 `Activate-Window` 再抓屏）。实测把一个最小化的资源管理器还原成前台窗口。
+  不想抢焦点就把配置里的 `annotate.activate` 设为 `false`；但**动作侧**的 `activate` 默认仍为 `true`，
+  物理点击本身也会激活目标窗口。
+- **截图是屏幕抓取，不是 PrintWindow**：内核用 `Graphics.CopyFromScreen` 抓窗口矩形，所以画面可信
+  的前提是「激活成功」。UAC 提权窗口、另一个虚拟桌面、拒绝 `SetForegroundWindow` 的应用 → 拍到的是上层内容。
+  注意：UIA 树不受影响，最小化窗口照样能读出完整树（实测该窗口 140 个节点、32 个列表项都在）。
+- **输入是真实注入**：`click` 的坐标路径与 `press_key` 走 `SendInput`，会移动真实光标；
+  `type_text` 是「写剪贴板 + Ctrl+V + 还原原剪贴板」（实测还原成功，粘完剪贴板不是注入内容）。
+  因此目标是**后台窗口**时收不到输入，必须先激活。
+- **老式控件不进树**：记事本的编辑区实测只有 3 个节点（窗口/两个 Pane），文本区没有控件可寻址，
+  只能按坐标点 + 视觉核对。
+- **单光标、无并发仲裁**：本线没有跨进程互斥，也不检测「用户正在输入」，多个 agent 或你本人同时操作会互相打断。
+  需要「让路给人」的场景请用带 arbiter 的实现（`dsh-cua` 有 `Local\dsh-cua-input-arbiter` 互斥 +
+  `GetLastInputInfo` 让路），两者互为补充。
+- **平台与形态**：仅 Windows + PowerShell 5.1；没有 record/replay，没有隔离沙箱。
+- `select_text` 为 best-effort：TextPattern 可用时 Select，否则聚焦元素。
+- UIA 内核常驻：首个调用含 ~0.9s 冷启动，之后每请求 ~60ms；空闲 120s 或 200 次请求后回收（改过 `uia.ps1` 需手动杀掉才生效）.
 
 ## 测试
 
