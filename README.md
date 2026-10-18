@@ -170,6 +170,10 @@ MCP 的跨进程快照默认保存在临时目录；并行使用多个 MCP 客�
 npm test                  # 无需预先打开应用的默认逻辑/协议测试
 npm run test:integration  # 需要按用例提示打开 Calculator / 编辑器窗口
 npm run test:e2e          # 自动拉起浏览器与记事本，覆盖完整工具面
+
+# 本线新增：直接对内核说 JSON 行协议，不需要 DSH，也不要求先开应用
+node scripts/local-repro.mjs  --title <窗口标题片段>   # list_apps / 名字解析 / 索引映射
+node scripts/local-verify.mjs --title <窗口标题片段>   # 6 项回归断言（P1 / P3×3 / P4 / P5）
 ```
 
 ## License
