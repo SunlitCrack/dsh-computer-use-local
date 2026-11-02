@@ -32,6 +32,10 @@ namespace System.Windows.Automation {
     // is the branch uia.ps1:1628 handles, and it cannot be reached with an
     // unresolvable path (that is :1624).
     public static string DriftDecoyName;
+    // Whether this node reports children at all. Real providers return nothing
+    // below a leaf; defaulting to "always has children" made the kernel's
+    // leaf-at-depth-limit check (which asks FindFirst) fire for every node.
+    public static bool HasChildren = true;
     public static TestElement FromHandle(IntPtr h) {
       Lookups.Add(h.ToInt64());
       if (h.ToInt64() == 101 && (FailRequestedWindow || FailuresRemaining-- > 0))
@@ -56,8 +60,18 @@ namespace System.Windows.Automation {
     public TestInvoke GetCurrentPattern(object pattern) { return new TestInvoke(Current.NativeWindowHandle); }
     // Identity lookup walks children; expose the configured child (if any) so a
     // recovery case has a tree to search instead of an empty stub.
+    //
+    // Scope matters and used to be ignored: the kernel calls FindAll with
+    // Children everywhere except one Descendants lookup (uia.ps1:1738), and a
+    // mock that answers anything regardless of scope cannot catch a wrong scope.
+    // Real providers also return nothing below a leaf -- answering with a child
+    // for EVERY node made the kernel's "does this element have children?" check
+    // always true, which is what the lazy-tree retry keys on.
     public ChildCollection FindAll(TreeScope scope, Condition condition) {
       var items = new List<TestElement>();
+      if ((scope & (TreeScope.Children | TreeScope.Descendants | TreeScope.Subtree)) == 0)
+        return new ChildCollection(items);
+      if (!AutomationElement.HasChildren) return new ChildCollection(items);
       // Drift shape: ordinal 0 is a decoy (wrong identity, but the path still
       // resolves onto it) and ordinal 1 carries the expected identity. That is
       // the branch uia.ps1:1628 handles; an unresolvable path takes :1624
@@ -73,6 +87,9 @@ namespace System.Windows.Automation {
       return new ChildCollection(items);
     }
     public TestElement FindFirst(TreeScope scope, Condition condition) {
+      if ((scope & (TreeScope.Children | TreeScope.Descendants | TreeScope.Subtree)) == 0)
+        return null;
+      if (!AutomationElement.HasChildren) return null;
       if (!string.IsNullOrEmpty(AutomationElement.DriftDecoyName))
         return new TestElement(Current.NativeWindowHandle, AutomationElement.DriftDecoyName);
       if (!string.IsNullOrEmpty(AutomationElement.IdentityChildName))
@@ -120,6 +137,45 @@ foreach ($definition in $ast.FindAll({ param($node)
 }, $true)) {
   if ($functions -contains $definition.Name) { Invoke-Expression $definition.Extent.Text }
 }
+
+# --- isolation guard -------------------------------------------------------
+# The kernel sends real input through [CuInput] and [System.Windows.Forms
+# .SendKeys], and screenshots through [System.Drawing]. None of those exist here
+# because extraction runs only FUNCTION BODIES: the top-level Add-Type lines that
+# define them never execute.
+#
+# That is an accident of this design, not a decision -- and a dangerous one. Add
+# one `Add-Type -AssemblyName System.Windows.Forms` here (say, to make set_value
+# testable) and the loaded Invoke-Action would start typing into real windows
+# while the suite still reported green. Fail loudly instead.
+#
+# CuNative is deliberately NOT on this list: this fixture defines its own
+# CuNative mock (queries only). The real one in lib/uia.ps1 additionally carries
+# keybd_event. Capability is checked below instead of trusting the name.
+$forbidden = @(
+  'CuInput',                       # SendMouse / SendKey / SendUnicode
+  'System.Windows.Forms.SendKeys', # SendWait
+  'System.Drawing.Bitmap'          # CopyFromScreen target
+)
+foreach ($name in $forbidden) {
+  $available = $false
+  try { $null = [type]$name; $available = $true } catch { }
+  if ($available) {
+    throw ("fixture isolation broken: [$name] is available in this process, so the loaded kernel " +
+      'could send real input or capture the real screen. Do not load those assemblies here; stub the ' +
+      'helper instead (see Invoke-ClickAt / Invoke-Scroll).')
+  }
+}
+# The mock CuNative must stay query-only. If it ever grows an input method, the
+# loaded kernel could call it and really press keys.
+foreach ($member in @('keybd_event', 'SendKey', 'SendUnicode', 'SendMouse')) {
+  $has = $false
+  try { $has = $null -ne ([CuNative].GetMethod($member)) } catch { }
+  if ($has) {
+    throw "fixture isolation broken: the mock [CuNative] exposes '$member'; it must stay query-only."
+  }
+}
+$script:IsolationGuard = 'ok'
 
 function Start-Sleep { param($Milliseconds) }
 function Resolve-Window { param($target) return [IntPtr]101 }
@@ -180,6 +236,7 @@ function Reset-Fixture {
   # so a case only passed because the previous one happened to clear the flag.
   [System.Windows.Automation.AutomationElement]::IdentityChildName = $null
   [System.Windows.Automation.AutomationElement]::DriftDecoyName = $null
+  [System.Windows.Automation.AutomationElement]::HasChildren = $true
 }
 function Capture-Outcome([scriptblock]$work) {
   try { return @{ result = (& $work); error = $null } }
