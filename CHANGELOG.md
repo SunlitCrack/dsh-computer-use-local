@@ -1,5 +1,52 @@
 # 更新记录
 
+## 0.3.2-local.1 — 2026-11-02
+
+在 `0.3.1-local.1`（P1–P5 基线）之上，修掉「工具栏点不中」这条链路上的三层缺陷。P1–P5 全部保留，逐项回归通过。
+
+**根因链**：`maxDepth: 8` 剪掉 depth 11–12 的工具栏 → 冷启动首次 UIA 查询只拿到原生外壳（14 元素）→
+`click({marker})` 的吸附候选池为空 → 退化为裸像素点击且回显看不出 → 用户只能靠猜像素。
+
+- **遍历预算** `maxDepth` 8→15、`maxNodes` 400→1600，六处默认值同源（`lib/index.js` schema、`lib/tools.js`、
+  `lib/uia.ps1` 内核兜底、包内 `cordis.patch.yml`、profile patch、`mcp-server.mjs`）。
+  实测同一窗口 d8 只有 3 个 Button（全是标题栏），d15 有 50–87 个、工具栏 20 个全在。
+  `maxNodes` 必须同步放大：400 会和深度同时截断，让 `maxDepth` 形同无效（15 深的 Electron 窗口约访问 500 次）。
+- **惰性无障碍树重试**（`lib/uia.ps1`）：Chrome/Electron 冷启动后首次查询只返回 14 个元素的原生外壳，
+  隔一会再查才是完整树。判定**只看可测规模**（未截断 + 窗口 ≥400000 px² + 元素数 <40），最多重试 3 次；
+  每轮与当前最优比较并保留元素最多的那份，绝不返回更差结果；`lazyTreeGained` 记录净增，`gained=0` 时不谎报重建。
+  不采用「有没有 Document 节点」作判据 —— 资源管理器有 155 元素、完整可用却无 Document，那条判据会每轮误重试。
+- **`get_app_state` 单次预算覆盖**：新增 `maxDepth` / `maxNodes` 参数（clamp 与内核同源），
+  此前参数表只有 `app`，模型没有提深手段。
+- **截断信号回传给模型**：回传 `nodeCount` / `interactiveCount` / `maxSeenDepth` / `maxDepthUsed` /
+  `maxNodesUsed` / `truncatedByDepth` / `truncatedByNodes` / `lazyTree*`，并在 `treeText` 追加
+  `Warning:` / `Note:` / `Tree budget:` 三类可见行。此前内核算好了这些但工具层全部丢弃。
+- **截断判定修正**：depth 边界上的叶子节点不再算截断（先 `FindFirst(Children)` 确认确有子元素）。
+  修之前每个窗口都报 `truncatedByDepth=true`，警告全是噪声。
+- **`click` 失败可见**（`lib/tools.js`）：`snapMarkerPoint` 从「返回裸点」改为「返回判定」，
+  `via` 区分 `marker-snapped` / `marker-raw` / `coordinate` / `element`；render 输出四态，
+  同时给出 window 与 screenshot 两个坐标系、命中元素名、未吸附时的最近控件偏移与距离。
+  此前 marker 路径 `via` 恒为 `coordinate`，吸附成功与失败不可区分，且 `note` 只进 `value`
+  不进 model 可见的 render。
+- **吸附位移上限**（关键）：旧 `cap = 0.18×min(w,h)≈297px` 允许 163px 高的整条工具栏容器当宿主，
+  实测 131 个 marker 里 28 个位移 >60px、18 个 >150px、最大 225px，却报「吸附成功」。
+  改为 `hostCap = 0.08×min(w,h)≈132px` + `moveCap = 0.25×hostCap≈48px`：复测 >60px 归零、最大 43px。
+- **`nearby` 可用性**：剔除覆盖全窗口的容器（它包含点击点、距离 0，会挤掉真正相邻控件）；
+  disabled 控件不再抢首位；不再限定固定半径，近处无控件时如实给最近的几个。
+- **网格锚点** `E` 前缀改 `N` 并加 40 个上限：11 列是 A..K，格点已占 E1–E7，补点从 E8 起会被读成
+  「第 5 列第 8 行」；补点原本也没有数量上限（注释称 ≤100，实际 `while` 只管格点）。
+- **性能**：`GetSupportedPatterns()` 换成按插件实际消费的 8 个 pattern 逐个 `TryGetCurrentPattern`，
+  563 个元素从 1681ms 降到 441ms（3.8×）；整次 `get_app_state` 从 2292ms 降到 1535ms。
+
+验证（真实桌面，Win10 / PowerShell 5.1）：
+`scripts/local-verify.mjs` P1–P5 逐项通过（P5 多候选解析、P1 中文往返、P3 身份优先/路径可用/陈旧失败、P4 回执坐标）；
+惰性树热窗口 `retries=0` 不误触发、`maxDepth:3` 仍报真实截断、`N` 锚点 40 个；
+吸附位移对新旧规则对照（旧 28 个 >60px / 最大 225px，新 0 个 / 最大 43px）；
+逻辑测试 `scripts/logic-test.mjs` 通过。
+
+> 注：`local-verify.mjs` 的 P1 用例默认选中 `edits[0]`，在资源管理器里那是**搜索框**——
+> 它的 `SetValue` 会被搜索建议覆盖，属系统行为。改用地址栏做同一往返即 PASS（`unicode 验收 42` 原样读回）。
+> 这是测试选错了控件，不是编码缺陷。
+
 ## 0.3.1 — 2026-09-29
 
 - `peerDependencies` 的 `@deepseek-ai/dsh-tools` 由 `^0.1.2-rc.1` 放宽为 `>=0.1.2-rc.1 <0.3.0-0`。原范围上界是 `<0.2.0-0`，在 DSH 0.2.0 系列上不满足，DSH 官方兼容性闸门会判定不兼容并直接跳过本插件，导致内置 Computer Use 整体失效（10 个工具全部不注册）。实测修改前 0.2.0-rc.1/rc.2 判定拒绝，修改后 0.1.7-rc.1、0.1.7-rc.2、0.2.0-rc.1、0.2.0-rc.2 全部兼容。

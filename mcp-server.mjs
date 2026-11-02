@@ -53,8 +53,10 @@ const session = new ComputerUseSession();
 const config = Config({
   askBeforeActions: process.env.CU_APPROVAL === '1',
   includeScreenshot: true,
-  maxDepth: Number(process.env.CU_MAX_DEPTH) || 14,
-  maxNodes: Number(process.env.CU_MAX_NODES) || 900,
+  // Same budgets as the plugin path: a lower number here would cap MCP callers
+  // at the shallow-tree truncation the profile config was fixed for.
+  maxDepth: Number(process.env.CU_MAX_DEPTH) || 15,
+  maxNodes: Number(process.env.CU_MAX_NODES) || 1600,
   fx: { overlay: true, screenshot: false },
 });
 setAuditEnabled(config.audit !== false);

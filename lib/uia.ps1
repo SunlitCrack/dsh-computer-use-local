@@ -428,12 +428,24 @@ function Find-ElementByIdentity($root, $expected, $maxNodes) {
 }
 
 function Get-SecondaryActions($element) {
+  # Probe the same eight patterns the tree walk cares about instead of
+  # GetSupportedPatterns(), which is a cross-process query materializing every
+  # pattern the provider offers (~3x slower per element). Keep this list in step
+  # with the one in Invoke-GetState.
   $names = @()
-  try {
-    $names = @($element.GetSupportedPatterns() | ForEach-Object {
-      $_.ProgrammaticName -replace 'PatternIdentifiers\.|Pattern$',''
-    } | Where-Object { $_ -in @('Invoke','Toggle','ExpandCollapse','SelectionItem','ScrollItem','Value','Text','RangeValue') })
-  } catch {}
+  foreach ($sp in @(
+    @{ p = [System.Windows.Automation.InvokePattern]::Pattern; n = 'Invoke' },
+    @{ p = [System.Windows.Automation.TogglePattern]::Pattern; n = 'Toggle' },
+    @{ p = [System.Windows.Automation.ExpandCollapsePattern]::Pattern; n = 'ExpandCollapse' },
+    @{ p = [System.Windows.Automation.SelectionItemPattern]::Pattern; n = 'SelectionItem' },
+    @{ p = [System.Windows.Automation.ScrollItemPattern]::Pattern; n = 'ScrollItem' },
+    @{ p = [System.Windows.Automation.ValuePattern]::Pattern; n = 'Value' },
+    @{ p = [System.Windows.Automation.TextPattern]::Pattern; n = 'Text' },
+    @{ p = [System.Windows.Automation.RangeValuePattern]::Pattern; n = 'RangeValue' }
+  )) {
+    $probe = $null
+    try { if ($element.TryGetCurrentPattern($sp.p, [ref]$probe)) { $names += $sp.n } } catch {}
+  }
   return $names
 }
 
@@ -931,24 +943,32 @@ function Get-GridMarkers($elements, $windowRect) {
   }
 
   # Every candidate element must carry at least one marker, or clicking it by
-  # marker would be impossible; top uncovered elements up at their center with
-  # E1, E2, ... ids (skipping any id the lattice already used).
+  # marker would be impossible; top uncovered elements up at their center.
+  #
+  # The id prefix is 'N' (node), not 'E': the lattice already uses spreadsheet
+  # letters, so an 'E'-prefixed id collides with column E and reads as "column E,
+  # row 8" instead of "the 8th element anchor". The count is capped as well —
+  # the lattice is bounded to 100 markers but this top-up was not.
+  $maxAnchors = 40
   $next = 1
+  $added = 0
   foreach ($e in $cands) {
+    if ($added -ge $maxAnchors) { break }
     $covered = $false
     foreach ($m in $markers) {
       if ($m.x -ge $e.frame.x -and $m.x -le ($e.frame.x + $e.frame.width) -and
           $m.y -ge $e.frame.y -and $m.y -le ($e.frame.y + $e.frame.height)) { $covered = $true; break }
     }
     if ($covered) { continue }
-    $id = 'E' + $next
-    while (@($markers | Where-Object { $_.id -eq $id }).Count -gt 0) { $next++; $id = 'E' + $next }
+    $id = 'N' + $next
+    while (@($markers | Where-Object { $_.id -eq $id }).Count -gt 0) { $next++; $id = 'N' + $next }
     [void]$markers.Add([pscustomobject]@{
       id = $id
       x = [int]($e.frame.x + $e.frame.width / 2)
       y = [int]($e.frame.y + $e.frame.height / 2)
     })
     $next++
+    $added++
   }
   return $markers
 }
@@ -1064,8 +1084,11 @@ function Get-AutomationRoot([IntPtr]$hwnd) {
 
 function Invoke-GetState($params) {
   $timer = [System.Diagnostics.Stopwatch]::StartNew()
-  $maxDepth = if ($null -ne $params.maxDepth) { [Math]::Max(0, [Math]::Min(50, [int]$params.maxDepth)) } else { 8 }
-  $maxNodes = if ($null -ne $params.maxNodes) { [Math]::Max(1, [Math]::Min(5000, [int]$params.maxNodes)) } else { 400 }
+  # Fallback budgets for callers that send none. Kept in step with the plugin's
+  # schema defaults: a lower number here silently caps every request, which is
+  # exactly how the depth-8 toolbar truncation stayed hidden.
+  $maxDepth = if ($null -ne $params.maxDepth) { [Math]::Max(0, [Math]::Min(50, [int]$params.maxDepth)) } else { 15 }
+  $maxNodes = if ($null -ne $params.maxNodes) { [Math]::Max(1, [Math]::Min(5000, [int]$params.maxNodes)) } else { 1600 }
   $includeScreenshot = if ($null -eq $params.includeScreenshot) { $true } else { [bool]$params.includeScreenshot }
 
   $hwnd = Resolve-Window $params
@@ -1118,7 +1141,27 @@ function Invoke-GetState($params) {
       $ct = $el.Current.ControlType
       if ($ct) { $controlType = $ct.ProgrammaticName -replace 'ControlType\.','' }
     } catch {}
-    try { $patterns = @($el.GetSupportedPatterns() | ForEach-Object { $_.ProgrammaticName -replace 'PatternIdentifiers\.|Pattern$','' }) } catch {}
+    # GetSupportedPatterns() is a cross-process query that materializes every
+    # pattern the provider offers: measured at 1681ms for 563 elements on this
+    # window, versus 441ms for probing only the patterns this plugin consumes
+    # with TryGetCurrentPattern (3.8x). We only ever read the eight names below.
+    try {
+      $patterns = @()
+      $statePats = @(
+        @{ p = [System.Windows.Automation.ValuePattern]::Pattern; n = 'Value' },
+        @{ p = [System.Windows.Automation.TextPattern]::Pattern; n = 'Text' },
+        @{ p = [System.Windows.Automation.RangeValuePattern]::Pattern; n = 'RangeValue' },
+        @{ p = [System.Windows.Automation.InvokePattern]::Pattern; n = 'Invoke' },
+        @{ p = [System.Windows.Automation.TogglePattern]::Pattern; n = 'Toggle' },
+        @{ p = [System.Windows.Automation.ExpandCollapsePattern]::Pattern; n = 'ExpandCollapse' },
+        @{ p = [System.Windows.Automation.SelectionItemPattern]::Pattern; n = 'SelectionItem' },
+        @{ p = [System.Windows.Automation.ScrollItemPattern]::Pattern; n = 'ScrollItem' }
+      )
+      foreach ($sp in $statePats) {
+        $probe = $null
+        if ($el.TryGetCurrentPattern($sp.p, [ref]$probe)) { $patterns += $sp.n }
+      }
+    } catch {}
     try {
       if ($patterns -contains 'Value') {
         $valuePattern = $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
@@ -1157,8 +1200,17 @@ function Invoke-GetState($params) {
 
     # maxDepth is the deepest level that may be captured: the window root is
     # depth 0, so a node expands only while its children stay within the budget.
+    # A leaf sitting exactly at the budget is NOT a truncation — it has nothing
+    # below it — so consult the real child count before flagging a cut. Without
+    # that check every window reports truncatedByDepth even when its tree is
+    # captured in full, which turns the truncation warning into noise.
     if (($path.Count + 1) -gt $maxDepth) {
-      $depthTruncated = $true
+      try {
+        $child = $el.FindFirst([System.Windows.Automation.TreeScope]::Children,
+          [System.Windows.Automation.Condition]::TrueCondition)
+        $hasChildren = ($null -ne $child)
+      } catch { $hasChildren = $true }   # unknown: assume there was more to lose
+      if ($hasChildren) { $depthTruncated = $true }
     } else {
       try {
         $children = $el.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)
@@ -1172,6 +1224,163 @@ function Invoke-GetState($params) {
     }
   }
   if ($queue.Count -gt 0) { $nodeTruncated = $true }
+
+  # Chromium/Electron builds its accessibility tree lazily: the FIRST UIA query
+  # after a cold start returns only the native chrome — window, a few panes and
+  # the three caption buttons, ~14 elements — because the web-content subtree has
+  # not been built. A second query, moments later, sees the materialized tree
+  # (100+ elements).
+  #
+  # The only sound signal is SIZE. Keying on "no Document node" is wrong: Windows
+  # Explorer exposes a complete, fully usable 155-element tree with no Document at
+  # all, and that rule retried it on every call while claiming the tree was
+  # "still being built". A small native window and a cold Chromium frame are
+  # indistinguishable by structure — but they are distinguishable by numbers.
+  #
+  # Retrying must also never make things worse: every attempt is compared against
+  # the best snapshot so far, and the best one wins.
+  $lazyTreeRetries = 0
+  $lazyTreeUnresolved = $false
+  $lazyTreeGained = 0
+  $windowArea = [double]$rect.width * [double]$rect.height
+  $looksTruncated = $depthTruncated -or $nodeTruncated
+  # Below this a window cannot hold a web UI worth rebuilding for.
+  $worthRetrying = (-not $looksTruncated) -and ($windowArea -ge 400000)
+  # A tree this small on a window this large is the cold-frame signature.
+  $sparseThreshold = 40
+  if ($worthRetrying -and $elements.Count -lt $sparseThreshold) {
+    $bestElements = $elements
+    $bestVisited = $visitedCount
+    $bestDepthTrunc = $depthTruncated
+    $bestNodeTrunc = $nodeTruncated
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+      Start-Sleep -Milliseconds (120 * $attempt)
+      # Re-resolve the root: the provider may have replaced the widget.
+      $retryRoot = $null
+      try { $retryRoot = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd) } catch {}
+      if ($null -eq $retryRoot) {
+        # Still count the attempt: it happened, and the caller must be able to
+        # tell "no attempts ran" from "attempts ran and failed".
+        $lazyTreeRetries = $attempt
+        continue
+      }
+      $queue = New-Object System.Collections.Queue
+      $queue.Enqueue(@{ el = $retryRoot; path = @() })
+      $retryDepthTrunc = $false
+      $retryNodeTrunc = $false
+      $retryVisited = 0
+      $retryElements = @()
+      while ($queue.Count -gt 0 -and $retryVisited -lt $maxNodes) {
+        $node = $queue.Dequeue()
+        $retryVisited++
+        $el = $node.el; $path = $node.path
+        $index = $retryElements.Count
+        $name = ''; $automationId = ''; $className = ''; $value = ''
+        $enabled = $true; $offscreen = $false; $controlType = 'Element'
+        $retryPatterns = @()
+        $elRect = @{ x = 0; y = 0; width = 0; height = 0 }
+        try { $name = [string]$el.Current.Name } catch {}
+        try { $automationId = [string]$el.Current.AutomationId } catch {}
+        try { $className = [string]$el.Current.ClassName } catch {}
+        try { $enabled = [bool]$el.Current.IsEnabled } catch {}
+        try { $offscreen = [bool]$el.Current.IsOffscreen } catch {}
+        try {
+          $ct = $el.Current.ControlType
+          if ($ct) { $controlType = $ct.ProgrammaticName -replace 'ControlType\.','' }
+        } catch {}
+        try {
+          foreach ($sp in @(
+            @{ p = [System.Windows.Automation.ValuePattern]::Pattern; n = 'Value' },
+            @{ p = [System.Windows.Automation.TextPattern]::Pattern; n = 'Text' },
+            @{ p = [System.Windows.Automation.RangeValuePattern]::Pattern; n = 'RangeValue' },
+            @{ p = [System.Windows.Automation.InvokePattern]::Pattern; n = 'Invoke' },
+            @{ p = [System.Windows.Automation.TogglePattern]::Pattern; n = 'Toggle' },
+            @{ p = [System.Windows.Automation.ExpandCollapsePattern]::Pattern; n = 'ExpandCollapse' },
+            @{ p = [System.Windows.Automation.SelectionItemPattern]::Pattern; n = 'SelectionItem' },
+            @{ p = [System.Windows.Automation.ScrollItemPattern]::Pattern; n = 'ScrollItem' }
+          )) {
+            $probe = $null
+            if ($el.TryGetCurrentPattern($sp.p, [ref]$probe)) { $retryPatterns += $sp.n }
+          }
+        } catch {}
+        try {
+          if ($retryPatterns -contains 'Value') {
+            $valuePattern = $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+            $value = [string]$valuePattern.Current.Value
+          } elseif ($retryPatterns -contains 'Text') {
+            $textPattern = $el.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern)
+            $value = [string]$textPattern.DocumentRange.GetText(-1)
+          }
+        } catch {}
+        try {
+          $r = $el.Current.BoundingRectangle
+          $elRect = @{ x = [int]($r.X - $rect.x); y = [int]($r.Y - $rect.y); width = [int]$r.Width; height = [int]$r.Height }
+          if ($elRect.width -lt 0) { $elRect.width = 0 }
+          if ($elRect.height -lt 0) { $elRect.height = 0 }
+        } catch {}
+        $secondary = @($retryPatterns | Where-Object { $_ -in @('Invoke','Toggle','ExpandCollapse','SelectionItem','ScrollItem','Value','Text','RangeValue') })
+        $settable = $retryPatterns -contains 'Value'
+        if (-not $offscreen) {
+          $retryElements += [pscustomobject]@{
+            index = $index
+            path = ($path -join '.')
+            role = $controlType
+            name = $name
+            value = $value
+            className = $className
+            automationId = $automationId
+            enabled = $enabled
+            settable = $settable
+            patterns = $retryPatterns
+            secondaryActions = $secondary
+            frame = $elRect
+          }
+        }
+        if (($path.Count + 1) -gt $maxDepth) {
+          try {
+            $child = $el.FindFirst([System.Windows.Automation.TreeScope]::Children,
+              [System.Windows.Automation.Condition]::TrueCondition)
+            $hasChildren = ($null -ne $child)
+          } catch { $hasChildren = $true }
+          if ($hasChildren) { $retryDepthTrunc = $true }
+        } else {
+          try {
+            $children = $el.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)
+            $i = 0
+            foreach ($child in $children) {
+              if (($retryVisited + $queue.Count) -ge $maxNodes) { $retryNodeTrunc = $true; break }
+              $queue.Enqueue(@{ el = $child; path = $path + $i })
+              $i++
+            }
+          } catch {}
+        }
+      }
+      if ($queue.Count -gt 0) { $retryNodeTrunc = $true }
+      # Record the attempt BEFORE deciding whether to stop: a rebuild is exactly
+      # the case worth reporting, and breaking first would leave the counter at 0
+      # and hide the fix.
+      $lazyTreeRetries = $attempt
+      if ($retryElements.Count -gt $bestElements.Count) {
+        $lazyTreeGained = $retryElements.Count - $bestElements.Count
+        $bestElements = $retryElements
+        $bestVisited = $retryVisited
+        $bestDepthTrunc = $retryDepthTrunc
+        $bestNodeTrunc = $retryNodeTrunc
+      }
+      # Stop as soon as the tree is clearly materialized: more attempts cannot
+      # help and each one costs a full walk.
+      if ($retryElements.Count -ge $sparseThreshold) { break }
+    }
+    # Never return the worst pass: keep whichever snapshot had the most elements,
+    # and restore its own truncation flags with it.
+    $elements = $bestElements
+    $visitedCount = $bestVisited
+    $depthTruncated = $bestDepthTrunc
+    $nodeTruncated = $bestNodeTrunc
+    # Unresolved only when nothing grew across every attempt — a genuinely sparse
+    # app, not a tree that was merely late.
+    if ($lazyTreeGained -eq 0) { $lazyTreeUnresolved = $true }
+  }
 
   $screenshot = ''
   $markers = @()
@@ -1197,6 +1406,73 @@ function Invoke-GetState($params) {
       $bmp.Dispose()
       $screenshot = [Convert]::ToBase64String($ms.ToArray())
     } catch { $screenshot = ''; $markers = @(); $lastPointDrawn = $false }
+  }
+
+  # Truncation diagnostics. A tree cut at a budget silently drops whole control
+  # bands: Electron toolbars/sidebars sit at depth 11-12, so a shallow budget
+  # yields a snapshot that provably lacks them while still looking valid.
+  #
+  # ScrollItem is deliberately excluded from "actionable": Chromium grants it to
+  # nearly every Pane, so counting it would make any window look interactive.
+  # What actually distinguishes a usable snapshot is a real Invoke/Toggle/
+  # ExpandCollapse/SelectionItem/Value host.
+  $actionableCount = ($elements | Where-Object {
+    $_.settable -or (@($_.secondaryActions | Where-Object {
+      $_ -in @('Invoke','Toggle','ExpandCollapse','SelectionItem')
+    }).Count -gt 0)
+  } | Measure-Object).Count
+  $maxSeenDepth = 0
+  foreach ($e in $elements) {
+    $d = @($e.path.Split('.') | Where-Object { $_ -ne '' }).Count
+    if ($d -gt $maxSeenDepth) { $maxSeenDepth = $d }
+  }
+  # Two distinct failure modes, kept apart so neither masks the other:
+  #
+  # 1. A budget cut. A leaf at the depth limit no longer counts as a cut, so any
+  #    true flag is real lost content worth reporting regardless of how many
+  #    elements survived — a node cut can keep 100 elements and still drop the
+  #    entire toolbar band.
+  # 2. Sparse and unusable. Nothing was cut, yet no control is actionable: the
+  #    app draws its own UI and exposes no usable tree. Raising a budget cannot
+  #    help here, and saying so prevents a pointless retry loop.
+  $treeWarning = ''
+  if ($depthTruncated -or $nodeTruncated) {
+    $limit = if ($nodeTruncated -and -not $depthTruncated) {
+      "the node budget (maxNodes=$maxNodes) cut this traversal short"
+    } elseif ($nodeTruncated) {
+      "both budgets cut this traversal short (maxDepth=$maxDepth, maxNodes=$maxNodes)"
+    } else {
+      "the depth budget (maxDepth=$maxDepth) cut this traversal short"
+    }
+    $treeWarning = "accessibility tree incomplete - $limit. This snapshot kept $($elements.Count) element(s) " +
+      "($actionableCount actionable) out of $visitedCount visited, so controls outside the budget are missing entirely. " +
+      "Chromium/Electron toolbars and sidebars live at depth 11-12: retry get_app_state with maxDepth=15 and " +
+      "maxNodes>=1600 (the node budget counts visits, including offscreen and expanded children) " +
+      "before clicking blind or guessing pixels."
+  } elseif ($actionableCount -eq 0 -and $elements.Count -le 12) {
+    try {
+      $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+      $waArea = [double]$wa.Width * [double]$wa.Height
+      $winArea = [double]$rect.width * [double]$rect.height
+      if ($waArea -gt 0 -and $winArea -ge (0.25 * $waArea)) {
+        # Do not claim the tree is "complete" when the lazy-tree rebuilds gave up:
+        # two warnings that contradict each other leave the caller guessing. They
+        # describe the same outcome — nothing usable is exposed — so this single
+        # message says what is known and what to do about it.
+        if ($lazyTreeUnresolved) {
+          $treeWarning = "no usable controls exposed - this window yields $($elements.Count) element(s) and " +
+            "$actionableCount actionable even after $lazyTreeRetries rebuild attempt(s) over $([int]($winArea / 1000))k px. " +
+            "Either the app exposes almost nothing through UI Automation, or its provider is still starting up. " +
+            "Calling get_app_state once more often resolves the second case; otherwise locate targets on the " +
+            "screenshot and click pixel coordinates, or prefer keyboard navigation."
+        } else {
+          $treeWarning = "no actionable controls exposed - this window's tree is complete (not truncated) but yields " +
+            "$($elements.Count) element(s) and $actionableCount actionable, so the app draws its own UI and exposes " +
+            "little or no usable accessibility. A larger maxDepth/maxNodes will not help: locate targets on the " +
+            "screenshot and click pixel coordinates, or prefer keyboard navigation."
+        }
+      }
+    } catch {}
   }
 
   # tree text like Codex <app_state>
@@ -1233,6 +1509,14 @@ function Invoke-GetState($params) {
     truncatedByNodes = $nodeTruncated
     truncatedByDepth = $depthTruncated
     maxDepth = $maxDepth
+    maxNodes = $maxNodes
+    interactiveCount = $actionableCount
+    actionableCount = $actionableCount
+    maxSeenDepth = $maxSeenDepth
+    lazyTreeRetries = $lazyTreeRetries
+    lazyTreeUnresolved = $lazyTreeUnresolved
+    lazyTreeGained = $lazyTreeGained
+    treeWarning = $treeWarning
     durationMs = [int]$timer.ElapsedMilliseconds
     screenshot = $screenshot
     screenshotWidth = $rect.width

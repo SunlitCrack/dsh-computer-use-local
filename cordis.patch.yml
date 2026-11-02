@@ -5,8 +5,11 @@
       name: '@milkuovo/dsh-computer-use'
       config:
         askBeforeActions: false
-        maxDepth: 8
-        maxNodes: 400
+        # Electron/Chromium 的工具栏、侧边栏在 depth 11-12；旧的 maxDepth: 8 会把它们整层剪掉，
+        # 而快照看起来仍然有效（只有 Pane、零 Button），导致点击只能靠猜像素。
+        # maxNodes 必须比深度预算宽松：它统计的是访问节点（含 offscreen、含被展开的 children）。
+        maxDepth: 15
+        maxNodes: 1600
         includeScreenshot: true
         annotate:
           grid: true        # 截图画编号十字准星网格；click({marker}) 按标记点选并吸附元素中心

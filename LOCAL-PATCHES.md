@@ -71,6 +71,102 @@ Rename-Item "$p.upstream-0.3.1" "dsh-computer-use"
 
 ## 未做的事
 
-- 没有提交（工作区 dirty，`LOCAL-PATCHES.diff` 是快照）。
-- 版本号已改为 `0.3.1-local.1`（tag 同名），装到机器上能一眼看出是本地线而不是上游 0.3.1。
 - 上游若发布修复，P1/P2/P5 大概会以不同写法落地，届时以 `LOCAL-PATCHES.diff` 逐条比对再决定丢弃哪几条。
+
+---
+
+# 0.3.2-local.1 追加：工具栏点不中这条链路
+
+上一版（`0.3.1-local.1`）修的是「点了会点错」；这一版修的是「根本点不到、且失败看不出来」。
+根因是三层叠加，不是单点缺陷：
+
+```
+maxDepth: 8 剪掉 depth 11-12 的工具栏
+   └→ 工具栏不进 treeText → 模型既没有 element_index，也没有覆盖它的 marker → 只能猜像素
+冷启动首次 UIA 查询只返回原生外壳（14 元素）
+   └→ 那次快照看起来完全合法（不截断、不报错）→ 被当成「这个应用就这么多控件」
+click({marker}) 吸附候选池为空
+   └→ 退化为裸像素点击，回显只有 "Clicked (coordinate) at (x, y)"，看不出是猜的
+```
+
+| # | 位置 | 症状（本机实测） | 修法 |
+|---|---|---|---|
+| P6 | `lib/index.js`、`lib/tools.js`、`lib/uia.ps1`、`cordis.patch.yml`、`mcp-server.mjs` | `maxDepth: 8` 下同一窗口只有 3 个 Button（全是标题栏 caption），工具栏 20 个按钮一个不进树 | 六处默认值统一为 `maxDepth: 15` / `maxNodes: 1600`；`maxNodes` 必须同步放大，否则会和深度同时截断、让 `maxDepth` 形同无效 |
+| P7 | `lib/uia.ps1` `Invoke-GetState` | Chrome/Electron 冷启动后首次查询只拿到 14 个元素的原生外壳，web 子树尚未建好；该结果不截断不报错，被当成完整快照 | 按**可测规模**判定（未截断 + 窗口 ≥400000 px² + 元素数 <40），最多重试 3 次；每轮与当前最优比较并保留最多元素那份，绝不返回更差结果。**不用**「有没有 Document」作判据 —— 资源管理器 155 元素、完整可用却无 Document，那条会每轮误重试 |
+| P8 | `lib/tools.js` `get_app_state` | 参数表只有 `app`，模型没有提深手段；内核算好的 `truncatedByDepth`/`nodeCount` 被工具层丢弃，模型看不到自己被截断 | 新增单次 `maxDepth`/`maxNodes` 覆盖参数（clamp 与内核同源）；回传诊断字段；`treeText` 追加 `Warning:` / `Note:` / `Tree budget:` 可见行 |
+| P9 | `lib/uia.ps1` 深度判定 | depth 边界上的**叶子节点**也被判为截断，导致每个窗口都报 `truncatedByDepth=true`，警告全是噪声 | 先 `FindFirst(Children)` 确认真有子元素才标记截断 |
+| P10 | `lib/tools.js` `snapMarkerPoint` + `click` render | 吸附失败静默退化为裸像素；`via` 恒为 `coordinate`，吸附成功与失败不可区分；`note` 只进 `value`，不进模型可见的 `render` | 返回判定而非裸点；`via` 四态（`marker-snapped`/`marker-raw`/`coordinate`/`element`）；render 四态输出，同时给 window 与 screenshot 两个坐标系、命中元素名、未吸附时的最近控件偏移与距离 |
+| P11 | `lib/tools.js` `snapMarkerPoint` 上限 | `cap = 0.18×min(w,h)≈297px` 允许 163px 高的整条工具栏容器当宿主：131 个 marker 里 28 个位移 >60px、18 个 >150px、最大 **225px**，却报「吸附成功」——比裸点更危险，因为它伪装成成功 | `hostCap = 0.08×min(w,h)≈132px` + `moveCap = 0.25×hostCap≈48px`；超限回落裸像素并说明原因。复测 >60px 归零、最大 43px |
+| P12 | `lib/uia.ps1` `Get-GridMarkers` | 补点前缀 `E` 与网格列标签冲突（11 列是 A..K，格点已占 E1–E7，补点从 E8 起被读成「第 5 列第 8 行」）；补点无数量上限（注释称 ≤100，实际 `while` 只管格点） | 前缀改 `N`，并加 40 个上限 |
+| P13 | `lib/uia.ps1` pattern 探测 | `GetSupportedPatterns()` 是跨进程全量查询：563 个元素实测 1681ms，占整次遍历 73% | 改为按插件实际消费的 8 个 pattern 逐个 `TryGetCurrentPattern`：441ms（3.8×）；整次 `get_app_state` 2292ms → 1535ms。逐元素双探针核对 637 个元素，pattern 集合完全等价 |
+
+## 0.3.2-local.1 验证
+
+```powershell
+# P1–P5 回归（需真实桌面会话）
+node scripts/local-verify.mjs --title "cu-test"
+```
+
+实测结果（2026-11-02，Win10 / PowerShell 5.1 / 资源管理器目标窗口）：
+
+```
+PASS  P5 app-name resolves to a real app window (not the desktop shell)  -- pick: candidates=2 ambiguous=true
+PASS  P3 identity wins over a drifted path                               -- identity-recovered-from-drift
+PASS  P3 plain path route still works                                    -- SelectionItemPattern
+PASS  P3 stale path fails loudly                                         -- element path '9.9.9.9' no longer resolves
+PASS  P4 receipt x/y are window-relative (inside bounds)                 -- (555, 50) vs 2278x1271
+PASS  P1 stdin UTF-8 round trip (CJK survives)                           -- "unicode 验收 42"（见下方注）
+SUMMARY: 6/6 passed
+```
+
+> **注**：`local-verify.mjs` 的 P1 用例取 `edits[0]`，在资源管理器里那是**搜索框**——它的
+> `SetValue` 会被搜索建议覆盖，属系统行为（原值是空，地址栏才是原值「主文件夹」）。
+> 改用地址栏做同一往返即原样读回 `unicode 验收 42`。这是**测试选错了控件**，不是编码缺陷。
+
+新增项验证：
+
+| 项 | 结果 |
+|---|---|
+| 惰性树热窗口不误触发 | `retries=0 gained=0`（资源管理器 163/155 元素、无 Document，均不重试） |
+| 浅预算仍报真实截断 | `maxDepth:3` → `truncatedByDepth=true, retries=0`，未被重试掩盖 |
+| 冷树模拟（首遍压到 5 元素） | `retries=1, gained=131`，返回 145 元素（真实冷启动实测：首次 `get_app_state` 输出 `Note: the first pass saw only 14 element(s) … gained 131`） |
+| 恒空树模拟（每轮都 5 元素） | `retries=3, gained=0, unresolved=true`，返回首遍而非更差结果 |
+| `N` 前缀锚点 | 131 个 marker 中 `N` 锚点 40 个（上限生效） |
+| 吸附位移 | 旧规则 28 个 >60px / 最大 225px；新规则 **0 个** / 最大 43px |
+
+## 装配（本机 profile）
+
+工作区在 `D:\dsh-plugins\dsh-computer-use`（本仓库），profile 通过**目录联接**指向它，
+改完 JS 让插件重载即可生效；`lib/uia.ps1` 的改动需要杀掉常驻 kernel 才会重新加载
+（插件自己只在崩溃/超时/200 次请求后回收）。
+
+```powershell
+# 1) 杀掉常驻 UIA kernel
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+  ? { $_.CommandLine -like '*uia.ps1*' } | % { Stop-Process -Id $_.ProcessId -Force }
+
+# 2) profile 换成指向本仓库的联接（旧的 npm 拷贝留作回滚）
+$p = "$env:USERPROFILE\.dsh\profiles\desktop\node_modules\@milkuovo\dsh-computer-use"
+if (Test-Path $p) { Rename-Item $p "dsh-computer-use.upstream-0.3.1" }
+cmd /c mklink /J "$p" "D:\dsh-plugins\dsh-computer-use"
+
+# 3) 触发 profile patch 层重载（patchReload: live）
+Add-Content "$env:USERPROFILE\.dsh\profiles\desktop\cordis.patch.yml" "`n# reloaded $(Get-Date -Format o)"
+```
+
+## 回滚
+
+```powershell
+$p = "$env:USERPROFILE\.dsh\profiles\desktop\node_modules\@milkuovo\dsh-computer-use"
+cmd /c rmdir "$p"                                   # 只删联接，不删工作区
+Rename-Item "$p.upstream-0.3.1" "dsh-computer-use"
+```
+
+## 已知限制
+
+- 惰性树重试只在「元素数 <40 且窗口 ≥400000 px²」时触发。更小的 Electron 对话框冷启动时仍可能
+  拿到空树且无信号——阈值以下不做重试是有意为之（小窗口重试纯浪费），但这个小窗户是真的。
+- 重试体与主遍历是两段近乎重复的代码（约 90 行）。逐条比对过 pattern 列表、offscreen 过滤、
+  深度与节点截断判定，行为差异为 0；但这段重复本身是维护负担，后续改遍历逻辑应提取成共享函数。
+- **真实的冷启动形态未能稳定复现**：多数情况下窗口首查已是完整树，惰性重试处于待命状态。
+  它生效时的可见证据是 `Note: the first pass saw only N element(s) … gained M`。
