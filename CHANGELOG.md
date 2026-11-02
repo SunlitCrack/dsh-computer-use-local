@@ -1,5 +1,24 @@
 # 更新记录
 
+## 0.3.2-local.10 — 2026-11-02
+
+复核指出夹具提供的保证比看上去弱，两处均已加固：
+
+- **隔离原本是「碰巧」，现在是显式断言**。夹具只用 AST 抽取**函数体**，`uia.ps1` 顶层的
+  `Add-Type` / `Add-Type -AssemblyName` 从不执行，所以 `[CuInput]`、`[System.Windows.Forms.SendKeys]`、
+  `[System.Drawing]` 天然不存在——把它们挡在门外的是这个巧合，不是设计。
+  只要有人为测 `set_value` 在这里加一行 `Add-Type -AssemblyName System.Windows.Forms`，
+  被真实加载的 `Invoke-Action` 就会开始向真实窗口发键盘，而测试仍然全绿。
+  现在在任何用例执行前断言这三类不可用，并检查 mock `CuNative` 不含输入方法
+  （它是只读 mock，名字本身不能证明什么）。两个方向都实测：正常跑通过；
+  人为加载程序集会被明确报错拦下。
+- **`FindAll`/`FindFirst` 不再忽略 scope 与叶子状态**：内核除 `uia.ps1:1738` 一处 `Descendants` 外
+  都用 `Children`，而 scope 盲的 mock 无法发现用错 scope；`HasChildren` 开关默认 true，
+  使叶子节点可以真正报告「没有子元素」——此前对任何节点都回答「有子元素」，
+  会让内核的「深度边界上的叶子不算截断」判定恒真，而那正是惰性树重试所依赖的信号。
+
+全套测试 57/57；反向检查守卫仍判定干净副本为干净。
+
 ## 0.3.2-local.9 — 2026-11-02
 
 独立复核（夹具与用例）推翻了两处此前的结论，均已修复：
