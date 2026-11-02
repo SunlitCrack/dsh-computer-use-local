@@ -1,5 +1,26 @@
 # 更新记录
 
+## 0.3.2-local.9 — 2026-11-02
+
+独立复核（夹具与用例）推翻了两处此前的结论，均已修复：
+
+- **`scripts/reverse-check.mjs` 会对任何回退——包括没有回退——打印 PASS**。三个缺陷叠加：
+  副本排除了 `node_modules`（测试连 `@deepseek-ai/dsh-tools` 都 import 不了，必然"失败"）；
+  失败正则把**文件级**行 `✖ test\output-schema.test.mjs` 当成用例名收下（import 崩溃看起来像用例失败）；
+  `join("")` 得到 `.` 使排除串变成 `..git`（`.git` 反被复制）。
+  实测：未做任何修改的干净副本也返回非空失败列表。**因此上一版"七项修复全部有保护力"的结论是假的。**
+  现在会挂载依赖、只认用例级失败、把跑不起来的副本判为失败而非通过；
+  新增 `scripts/check-reverse-check.mjs` 专门守这一点，并纳入 `npm test`。修好后七项全部真实反向验证通过。
+- **P3 用例没测到 drift 分支**。此前用 `path=′9.9.9.9′`（不可解析），走的是 `uia.ps1:1624` 的
+  「路径解析不到」，报告 `identity-recovered`。而 P3 真正要防的是 `uia.ps1:1628` 的
+  「路径仍能解析、但解析到了别的元素」——该分支**零覆盖**：把它整个禁用后测试仍全绿（已实测）。
+  fixture 现在能造出这种树形状（序号 0 是诱饵、真实元素在旁边），新增两条用例覆盖
+  `identity-recovered-from-drift` 与不可恢复时的失败（报出实际找到的元素、且不点击任何东西）。
+- `Reset-Fixture` 现在清理 mock 开关（`IdentityChildName` / `DriftDecoyName`）：
+  此前残留会让用例顺序决定结果。`TreeScope` 改用真实 UIA 的枚举值与 `[Flags]`。
+
+全套测试 57/57；`reverse-check` 7/7，每条 PASS 都附具体失败用例名。
+
 ## 0.3.2-local.8 — 2026-11-02
 
 独立复核（发布物与端到端）发现三处发布物问题，其中一处是真实回滚陷阱：
