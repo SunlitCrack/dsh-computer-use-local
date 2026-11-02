@@ -145,7 +145,7 @@ index ec1e721..4318696 100644
    annotate: z
      .object({
 diff --git a/lib/tools.js b/lib/tools.js
-index 1812638..bd4a0f1 100644
+index 1812638..9599db4 100644
 --- a/lib/tools.js
 +++ b/lib/tools.js
 @@ -177,7 +177,7 @@ const REOBSERVE_TEXT = 'Next: call get_app_state to verify before any other acti
@@ -190,7 +190,7 @@ index 1812638..bd4a0f1 100644
    /** Model coordinates arrive in the ATTACHED image space (DSH may downscale);
     *  map them back to the capture space before kernel math. */
    function modelCoordinate(value) {
-@@ -314,25 +329,111 @@ export function buildTools(ctx, session, config = {}) {
+@@ -314,25 +329,118 @@ export function buildTools(ctx, session, config = {}) {
      return x == null || y == null ? null : session.toScreenPoint(modelCoordinate(x), modelCoordinate(y));
    }
  
@@ -248,13 +248,20 @@ index 1812638..bd4a0f1 100644
 +    const enabledOnly = hits.filter(({ el }) => el.enabled !== false);
 +    const pool = usable.length > 0 ? usable : (enabledOnly.length > 0 ? enabledOnly : hits);
 +    const within = pool.filter((h) => h.dist <= radius);
-+    const chosen = (within.length > 0 ? within : pool).slice(0, 5);
++    // Three, not five: a marker-raw receipt already ran to ~600 characters with
++    // five entries, and the extra names were containers with long names that
++    // pushed the useful controls to the end. Labels are shortened here rather
++    // than in elementLabel, which also names the element a snap landed on and
++    // must stay readable.
++    const NEARBY_LIMIT = 3;
++    const NEARBY_LABEL = 40;
++    const chosen = (within.length > 0 ? within : pool).slice(0, NEARBY_LIMIT);
 +    return {
 +      radius,
 +      total: hits.length,
 +      nearestDistance: pool.length > 0 ? pool[0].dist : null,
 +      list: chosen.map(({ el, dx, dy, dist }) => ({
-+        label: elementLabel(el),
++        label: elementLabel(el).slice(0, NEARBY_LABEL),
 +        dx,
 +        dy,
 +        dist,
@@ -311,7 +318,7 @@ index 1812638..bd4a0f1 100644
      for (const el of elements) {
        if (!el || el.enabled === false) continue;
        const secondaryActions = Array.isArray(el.secondaryActions) ? el.secondaryActions : [];
-@@ -344,19 +445,64 @@ export function buildTools(ctx, session, config = {}) {
+@@ -344,19 +452,64 @@ export function buildTools(ctx, session, config = {}) {
        if (!interactive) continue;
        const f = el.frame;
        if (!f || cx < f.x || cx > f.x + f.width || cy < f.y || cy > f.y + f.height) continue;
@@ -382,7 +389,7 @@ index 1812638..bd4a0f1 100644
      };
    }
  
-@@ -439,8 +585,26 @@ export function buildTools(ctx, session, config = {}) {
+@@ -439,8 +592,26 @@ export function buildTools(ctx, session, config = {}) {
        motion?.commit();
        const result = await pendingResult;
        const fallback = validTargets.at(-1) ?? null;
@@ -410,7 +417,7 @@ index 1812638..bd4a0f1 100644
          : fallback;
        if (finalPoint) session.recordAction(kind, finalPoint.x, finalPoint.y);
        return result;
-@@ -507,7 +671,17 @@ export function buildTools(ctx, session, config = {}) {
+@@ -507,7 +678,17 @@ export function buildTools(ctx, session, config = {}) {
          'Returns the accessibility tree with numbered element indices — every line carries frame=[x,y,w,h] in screenshot pixels, '
          + 'so a tree hit can be clicked directly by its frame center without reading the screenshot — plus a screenshot of the window. ' +
          'Coordinates in click/scroll/drag are screenshot-relative pixels.',
@@ -429,7 +436,7 @@ index 1812638..bd4a0f1 100644
        output: {
          schema: {
            type: 'object',
-@@ -534,10 +708,47 @@ export function buildTools(ctx, session, config = {}) {
+@@ -534,10 +715,47 @@ export function buildTools(ctx, session, config = {}) {
                    },
                  },
                  foreground: { type: 'boolean', required: true },
@@ -477,7 +484,7 @@ index 1812638..bd4a0f1 100644
              treeText: { type: 'string', required: true },
              screenshotRef: {
                oneOf: [
-@@ -563,18 +774,38 @@ export function buildTools(ctx, session, config = {}) {
+@@ -563,18 +781,38 @@ export function buildTools(ctx, session, config = {}) {
          const continuationHwnd = session.matchesApp(args.app)
            ? session.state?.window?.hwnd ?? null
            : null;
@@ -518,7 +525,7 @@ index 1812638..bd4a0f1 100644
          // Kernel markers are capture pixels — stored as-is, never rescaled by
          // modelScale (click({marker}) maps them straight through toScreenPoint).
          session.markers = Array.isArray(result.markers) ? result.markers : [];
-@@ -618,11 +849,59 @@ export function buildTools(ctx, session, config = {}) {
+@@ -618,11 +856,59 @@ export function buildTools(ctx, session, config = {}) {
          if (result.lastPointDrawn === true) {
            result.treeText += LAST_POINT_LEGEND;
          }
@@ -578,7 +585,7 @@ index 1812638..bd4a0f1 100644
            treeText: result.treeText,
            screenshotRef,
          };
-@@ -662,14 +941,109 @@ export function buildTools(ctx, session, config = {}) {
+@@ -662,14 +948,109 @@ export function buildTools(ctx, session, config = {}) {
            additionalProperties: false,
            properties: {
              ok: { type: 'boolean', required: true },
@@ -692,7 +699,7 @@ index 1812638..bd4a0f1 100644
        },
        async execute(args, exec) {
          requireFreshSnapshot(args.app, 'click');
-@@ -677,9 +1051,13 @@ export function buildTools(ctx, session, config = {}) {
+@@ -677,9 +1058,13 @@ export function buildTools(ctx, session, config = {}) {
          if (args.marker != null) targetDesc = `marker ${args.marker}`;
          else if (args.element_index != null) targetDesc = `element ${args.element_index}`;
          let path = null;
@@ -706,7 +713,7 @@ index 1812638..bd4a0f1 100644
          if (args.marker != null) {
            if (!Array.isArray(session.markers) || session.markers.length === 0) {
              throw new Error('click: no grid markers in session — call get_app_state first');
-@@ -691,19 +1069,54 @@ export function buildTools(ctx, session, config = {}) {
+@@ -691,19 +1076,54 @@ export function buildTools(ctx, session, config = {}) {
                'call get_app_state first',
              );
            }
@@ -761,7 +768,7 @@ index 1812638..bd4a0f1 100644
          } else {
            throw new Error('click requires either marker, element_index, or both x and y');
          }
-@@ -712,13 +1125,58 @@ export function buildTools(ctx, session, config = {}) {
+@@ -712,13 +1132,58 @@ export function buildTools(ctx, session, config = {}) {
              action: 'click',
              app: args.app,
              path,
@@ -821,7 +828,7 @@ index 1812638..bd4a0f1 100644
        },
        presentCall: () => pendingCall('click'),
      },
-@@ -741,6 +1199,7 @@ export function buildTools(ctx, session, config = {}) {
+@@ -741,6 +1206,7 @@ export function buildTools(ctx, session, config = {}) {
              ok: { type: 'boolean', required: true },
              via: { type: 'string' },
              error: { type: 'string' },
@@ -829,7 +836,7 @@ index 1812638..bd4a0f1 100644
              ...OBSERVATION_REQUIRED_PROPERTY,
            },
          },
-@@ -748,12 +1207,15 @@ export function buildTools(ctx, session, config = {}) {
+@@ -748,12 +1214,15 @@ export function buildTools(ctx, session, config = {}) {
        },
        async execute(args, exec) {
          requireFreshSnapshot(args.app, 'perform_secondary_action');
@@ -846,7 +853,7 @@ index 1812638..bd4a0f1 100644
            snapshot_hwnd: session.state?.window?.hwnd ?? null,
            secondary_action: args.action,
          }, { signal: exec?.signal }), { pulse: false, signal: exec?.signal }));
-@@ -784,10 +1246,12 @@ export function buildTools(ctx, session, config = {}) {
+@@ -784,10 +1253,12 @@ export function buildTools(ctx, session, config = {}) {
        },
        async execute(args, exec) {
          requireFreshSnapshot(args.app, 'set_value');
@@ -861,7 +868,7 @@ index 1812638..bd4a0f1 100644
          }, { signal: exec?.signal }), { pulse: false, signal: exec?.signal }));
        },
      },
-@@ -825,12 +1289,15 @@ export function buildTools(ctx, session, config = {}) {
+@@ -825,12 +1296,15 @@ export function buildTools(ctx, session, config = {}) {
        },
        async execute(args, exec) {
          requireFreshSnapshot(args.app, 'select_text');
@@ -878,7 +885,7 @@ index 1812638..bd4a0f1 100644
              snapshot_hwnd: session.state?.window?.hwnd ?? null,
              text: args.text,
              prefix: args.prefix,
-@@ -877,8 +1344,11 @@ export function buildTools(ctx, session, config = {}) {
+@@ -877,8 +1351,11 @@ export function buildTools(ctx, session, config = {}) {
        async execute(args, exec) {
          requireFreshSnapshot(args.app, 'scroll');
          let path = null;
@@ -891,7 +898,7 @@ index 1812638..bd4a0f1 100644
          }
          const target = elementPoint(args.element_index)
            ?? coordinatePoint(args.x, args.y)
-@@ -888,6 +1358,7 @@ export function buildTools(ctx, session, config = {}) {
+@@ -888,6 +1365,7 @@ export function buildTools(ctx, session, config = {}) {
              action: 'scroll',
              app: args.app,
              path,
@@ -1574,14 +1581,14 @@ index 1c0bafe..85c7218 100644
  });
  setAuditEnabled(config.audit !== false);
 diff --git a/package.json b/package.json
-index 7bcb342..d4c55e0 100644
+index 7bcb342..b35fb19 100644
 --- a/package.json
 +++ b/package.json
 @@ -1,6 +1,6 @@
  {
    "name": "@milkuovo/dsh-computer-use",
 -  "version": "0.3.1",
-+  "version": "0.3.2-local.7",
++  "version": "0.3.2-local.8",
    "description": "Codex Computer Use for DeepSeek Harness on Windows: screenshot + UI Automation tree + mouse/keyboard actions, aligned with the official 10-method Codex Computer Use tool surface. Registers as the exclusive provider on the official DSH 0.1.7+ computer-use seam when present. Includes a zero-dependency stdio MCP server.",
    "type": "module",
    "main": "lib/index.js",

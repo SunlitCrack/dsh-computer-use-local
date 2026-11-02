@@ -7,7 +7,7 @@
 //
 // Usage (repo root, with node_modules/@deepseek-ai/{dsh-tools,schemastery,cosmokit}):
 //   node scripts/reverse-check.mjs
-import { cpSync, readFileSync, writeFileSync, rmSync, mkdtempSync } from 'node:fs';
+import { cpSync, readFileSync, writeFileSync, rmSync, mkdtempSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -20,7 +20,21 @@ const original = readFileSync(toolsPath, 'utf8');
 const FINAL_POINT = /const finalPoint = kernelPoint\r?\n\s*\? \(kind === 'click' && b\r?\n\s*\? \{ x: kernelPoint\.x \+ b\.x, y: kernelPoint\.y \+ b\.y \}\r?\n\s*: kernelPoint\)\r?\n\s*: fallback;/;
 
 const cases = [
-  { name: 'null note is dropped', from: /if \(merged\.note == null\) delete merged\.note;/, to: '/* reverted */' },
+  {
+    // Two mechanisms drop the null: a targeted `delete merged.note` and the
+    // blanket sweep. Reverting only the targeted line leaves the blanket one in
+    // place, so the suite stays green — correctly, because the behaviour still
+    // holds. Revert BOTH to reproduce the original defect.
+    name: 'null note is dropped (both mechanisms)',
+    from: /if \(merged\.note == null\) delete merged\.note;/,
+    to: '/* reverted */',
+    also: [
+      {
+        from: /if \(merged\[key\] === null && key !== 'ok'\) delete merged\[key\];/,
+        to: '/* reverted */',
+      },
+    ],
+  },
   {
     name: 'coordinate de-duplication',
     from: /const sameNumbers = value\.x != null && value\.captureX != null\r?\n\s*&& value\.x === value\.captureX && value\.y === value\.captureY;/,
@@ -51,22 +65,60 @@ const cases = [
   },
 ];
 
-/** Run the suite in `dir` and return the names of failing tests. */
+/** Run the suite in `dir` and return the names of failing CASES (not files). */
 function failingTests(dir, testFile) {
   try {
     execFileSync(process.execPath, ['--test', testFile], {
       cwd: dir, stdio: 'pipe', timeout: 180000, encoding: 'utf8',
     });
-    return [];
+    return { failed: [], crashed: false };
   } catch (error) {
-    // node --test prints "✖ <name>" per failure; collect them from both streams.
     const text = `${error.stdout ?? ''}\n${error.stderr ?? ''}`;
-    const names = new Set();
+    const failed = new Set();
     for (const line of text.split(/\r?\n/)) {
-      const m = line.match(/^\s*[✖x]\s+(.+?)\s+\(\d/);
-      if (m) names.add(m[1].trim());
+      // Case-level failures look like "✖ click by x/y: ... (4.7ms)".
+      // File-level ones look like "✖ test\output-schema.test.mjs (79.7ms)" and
+      // must NOT count: a copy whose imports crash produces only those, and
+      // treating them as failures made this script print PASS for every revert.
+      const m = line.match(/^\s*✖\s+(.+?)\s+\([\d.]+ms\)\s*$/);
+      if (!m) continue;
+      const name = m[1].trim();
+      if (/\.(mjs|cjs|js)$/.test(name)) continue;
+      failed.add(name);
     }
-    return [...names];
+    // A copy that cannot even import the test is not evidence about the fix.
+    const crashed = failed.size === 0;
+    return { failed: [...failed], crashed };
+  }
+}
+
+/**
+ * Give the throwaway copy a resolvable @deepseek-ai tree.
+ *
+ * The copy excludes node_modules so it stays cheap, but the tests import
+ * @deepseek-ai/dsh-tools (for validateJsonSchemaValue). Without this the copy
+ * cannot even load and every "failure" is an import crash, not a test result —
+ * which is exactly how this script used to report PASS for every revert.
+ * Sources: the local repo if it has them, otherwise the running DSH install.
+ */
+function linkNodeModules(dir) {
+  const targets = [
+    join(repo, 'node_modules'),
+    join(process.env.USERPROFILE ?? '', '.dsh', 'profiles', 'desktop', 'node_modules'),
+    // The profile does not ship dsh-tools; the harness install does.
+    join('D:\\DeepSeek Harness', 'resources', 'app', 'dsh', 'node_modules'),
+  ];
+  const host = targets.find((p) => {
+    try { readFileSync(join(p, '@deepseek-ai', 'dsh-tools', 'package.json')); return true; } catch { return false; }
+  });
+  if (!host) {
+    throw new Error('reverse-check needs @deepseek-ai/dsh-tools; install deps or run where the profile does');
+  }
+  const dest = join(dir, 'node_modules');
+  try {
+    symlinkSync(host, dest, 'junction');
+  } catch {
+    cpSync(host, dest, { recursive: true });
   }
 }
 
@@ -87,16 +139,34 @@ for (const c of cases) {
   dirs.push(dir);
   cpSync(repo, dir, {
     recursive: true,
-    filter: (src) => !src.includes('node_modules') && !src.includes(`${join('')}.git`),
+    // Exclude .git and node_modules by path SEGMENT. The previous
+    // `join('') + '.git'` produced '..git', which matched nothing, so .git was
+    // copied; and excluding node_modules left the copy unable to resolve
+    // @deepseek-ai/dsh-tools, so every copy "failed" to import.
+    filter: (src) => !/[\\/](node_modules|\.git)([\\/]|$)/.test(src),
   });
+  linkNodeModules(dir);
   writeFileSync(join(dir, targetFile), targetSource.replace(c.from, c.to));
-  const failed = failingTests(dir, c.test ?? 'test/output-schema.test.mjs');
-  if (failed.length === 0) {
+  // A fix may be carried by more than one mechanism; revert them together or the
+  // remaining one keeps the behaviour (and the test green).
+  for (const extra of c.also ?? []) {
+    const path = join(dir, extra.file ?? targetFile);
+    const source = readFileSync(path, 'utf8');
+    if (!extra.from.test(source)) {
+      console.log(`SKIP  ${c.name}: secondary anchor did not match in ${extra.file ?? targetFile}`);
+      failures++;
+      continue;
+    }
+    writeFileSync(path, source.replace(extra.from, extra.to));
+  }
+  const { failed, crashed } = failingTests(dir, c.test ?? 'test/output-schema.test.mjs');
+  if (crashed) {
+    console.log(`FAIL  reverting "${c.name}": the copy could not run the test at all (check node_modules)`);
+    failures++;
+  } else if (failed.length === 0) {
     console.log(`FAIL  reverting "${c.name}" breaks nothing — the suite does not cover it`);
     failures++;
   } else {
-    // Report what actually went red; more than one means the fix is entangled,
-    // which is information, not a pass by itself.
     console.log(`PASS  reverting "${c.name}" fails ${failed.length} case(s): ${failed.join(' | ')}`);
   }
 }

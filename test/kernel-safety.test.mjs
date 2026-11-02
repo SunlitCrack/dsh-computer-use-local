@@ -92,3 +92,22 @@ test('an identity that matches nothing fails instead of clicking a neighbour', w
   assert.equal(cases.identityMissing.result, null);
   assert.deepEqual(cases.identityMissing.pointerCalls, [], 'nothing may be clicked');
 });
+
+// The case P3 was actually written for: the path RESOLVES, onto a different
+// element. Distinct from the unresolvable path above -- different branch
+// (uia.ps1:1628 vs :1624) and a different message. Before this case existed the
+// drift branch had no coverage at all: disabling it left the suite green.
+test('a path that now resolves to a different element is recovered by identity', windowsOnly, () => {
+  assert.equal(cases.identityDrift.error, null);
+  assert.equal(cases.identityDrift.result.ok, true);
+  assert.match(cases.identityDrift.result.note ?? '', /identity-recovered-from-drift/,
+    'drift must be reported distinctly from a plain re-find');
+});
+
+test('a drifted path with nothing to recover fails and clicks nothing', windowsOnly, () => {
+  assert.match(cases.identityDriftUnrecoverable.error ?? '', /now resolves to a different element/);
+  assert.match(cases.identityDriftUnrecoverable.error ?? '', /someOtherButton/,
+    'the error must name the element it actually found');
+  assert.equal(cases.identityDriftUnrecoverable.result, null);
+  assert.deepEqual(cases.identityDriftUnrecoverable.pointerCalls, [], 'nothing may be clicked');
+});

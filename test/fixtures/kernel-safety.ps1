@@ -27,6 +27,11 @@ namespace System.Windows.Automation {
     // a named element exists. When set, children are produced under this name
     // so Find-ElementByIdentity has something to match; null means "no match".
     public static string IdentityChildName;
+    // Drift cases need the OPPOSITE shape: the path still resolves, but onto an
+    // element whose identity differs, with the real one sitting beside it. That
+    // is the branch uia.ps1:1628 handles, and it cannot be reached with an
+    // unresolvable path (that is :1624).
+    public static string DriftDecoyName;
     public static TestElement FromHandle(IntPtr h) {
       Lookups.Add(h.ToInt64());
       if (h.ToInt64() == 101 && (FailRequestedWindow || FailuresRemaining-- > 0))
@@ -53,17 +58,33 @@ namespace System.Windows.Automation {
     // recovery case has a tree to search instead of an empty stub.
     public ChildCollection FindAll(TreeScope scope, Condition condition) {
       var items = new List<TestElement>();
+      // Drift shape: ordinal 0 is a decoy (wrong identity, but the path still
+      // resolves onto it) and ordinal 1 carries the expected identity. That is
+      // the branch uia.ps1:1628 handles; an unresolvable path takes :1624
+      // instead, which is a different branch and a different message.
+      if (!string.IsNullOrEmpty(AutomationElement.DriftDecoyName)) {
+        items.Add(new TestElement(Current.NativeWindowHandle, AutomationElement.DriftDecoyName));
+        if (!string.IsNullOrEmpty(AutomationElement.IdentityChildName))
+          items.Add(new TestElement(Current.NativeWindowHandle, AutomationElement.IdentityChildName));
+        return new ChildCollection(items);
+      }
       if (!string.IsNullOrEmpty(AutomationElement.IdentityChildName))
         items.Add(new TestElement(Current.NativeWindowHandle, AutomationElement.IdentityChildName));
       return new ChildCollection(items);
     }
     public TestElement FindFirst(TreeScope scope, Condition condition) {
+      if (!string.IsNullOrEmpty(AutomationElement.DriftDecoyName))
+        return new TestElement(Current.NativeWindowHandle, AutomationElement.DriftDecoyName);
       if (!string.IsNullOrEmpty(AutomationElement.IdentityChildName))
         return new TestElement(Current.NativeWindowHandle, AutomationElement.IdentityChildName);
       return null;
     }
   }
-  public enum TreeScope { Children, Descendants }
+  // Values and [Flags] follow the real UI Automation enum; the fixture previously
+  // used Children=0, which no real provider returns and which made any
+  // scope-sensitive assertion meaningless.
+  [System.Flags]
+  public enum TreeScope { Element = 1, Children = 2, Descendants = 4, Parent = 8, Ancestors = 16, Subtree = 7 }
   public class Condition { public static readonly Condition TrueCondition = new Condition(); }
   public class ChildCollection : List<TestElement> {
     public ChildCollection() { }
@@ -155,6 +176,10 @@ function Reset-Fixture {
   $script:SecondaryCalls = @()
   $script:ScrollCalls = @()
   $script:DragCalls = @()
+  # Reset mock switches too: leaving them set made case order decide the result,
+  # so a case only passed because the previous one happened to clear the flag.
+  [System.Windows.Automation.AutomationElement]::IdentityChildName = $null
+  [System.Windows.Automation.AutomationElement]::DriftDecoyName = $null
 }
 function Capture-Outcome([scriptblock]$work) {
   try { return @{ result = (& $work); error = $null } }
@@ -255,5 +280,35 @@ $cases.identityMissing = Capture-Outcome {
   })
 }
 $cases.identityMissing.pointerCalls = @($script:PointerCalls)
+
+# Drift: the path STILL resolves, but onto a different element. This is the case
+# P3 was written for (a re-rendered tree re-orders siblings, so the same ordinal
+# lands on a neighbour) and it is a different branch from an unresolvable path
+# (uia.ps1:1628 vs :1624). It reported 'identity-recovered-from-drift'.
+Reset-Fixture
+[System.Windows.Automation.AutomationElement]::DriftDecoyName = 'someOtherButton'
+[System.Windows.Automation.AutomationElement]::IdentityChildName = 'safeButton'
+$cases.identityDrift = Capture-Outcome {
+  Invoke-Action ([pscustomobject]@{
+    action = 'click'; app = 'fixture'; snapshot_hwnd = 101
+    path = '0'
+    element_identity = @{ name = 'safeButton'; automationId = 'safeButton'; role = 'Button' }
+  })
+}
+$cases.identityDrift.pointerCalls = @($script:PointerCalls)
+
+# Drift with nowhere to recover to: the path resolves to a neighbour and the
+# recorded element is gone, so the action must fail and click nothing.
+Reset-Fixture
+[System.Windows.Automation.AutomationElement]::DriftDecoyName = 'someOtherButton'
+[System.Windows.Automation.AutomationElement]::IdentityChildName = $null
+$cases.identityDriftUnrecoverable = Capture-Outcome {
+  Invoke-Action ([pscustomobject]@{
+    action = 'click'; app = 'fixture'; snapshot_hwnd = 101
+    path = '0'
+    element_identity = @{ name = 'safeButton'; automationId = 'safeButton'; role = 'Button' }
+  })
+}
+$cases.identityDriftUnrecoverable.pointerCalls = @($script:PointerCalls)
 
 $cases | ConvertTo-Json -Depth 12 -Compress
