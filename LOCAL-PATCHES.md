@@ -201,7 +201,7 @@ P6–P13 之后又走了六版，其中三版是**修自己引入的缺陷**。�
   `output.schema`**，这正是 P14 能潜伏到线上的原因。
 - `scripts/reverse-check.mjs`：把每项修复在临时副本里逐个回退，断言对应测试会变红。
   「测试通过」不能说明修复被锁住——这一步才能。
-- `npm test` 现含 9 个测试文件，55 条断言全绿。
+- `npm test` 现含 9 个测试文件，59 条断言全绿（`local.11`）。
 
 ## 已知缺陷（未修）
 
@@ -209,7 +209,36 @@ P6–P13 之后又走了六版，其中三版是**修自己引入的缺陷**。�
   且 `lib/ps1.js` 在 `ok === false` 时直接 reject，render 的 `Click FAILED` 分支经 `execute()` 不可达。
   `perform_secondary_action` 的 `error` / `note` 同样拿不到。声明本身是为将来留位，
   但要知道它现在不会输出。
-- `marker-raw` 回执最坏 598 字符（`element` 路径的 5.2 倍）。5 条 `nearby` 里可能混入长名容器
-  （`elementLabel` 上限 56 字符），把有用控件挤到末尾。可考虑 `nearby` 取 3 条、label 截到 40。
+- `marker-raw` 回执最坏 598 字符（`element` 路径的 5.2 倍）。`nearby` 上限已在 `local.8` 收到 3 条、
+  label 截到 40 字符；剩余长度来自最近控件列表本身，属预期。
 - `get_app_state` 的 `treeText` 尾部现在混有五种风格的行（`Grid:` / `Amber ring:` 无前缀，
   `Note:` / `Truncated:` / `Warning:` / `Tree budget:` 带前缀）。语义自解释，但对模型不算干净。
+
+### 测试夹具的隔离强度有上限（决定不再加固）
+
+`test/fixtures/kernel-safety.ps1` 靠 PowerShell AST 从真实 `lib/uia.ps1` 按白名单抽取函数，
+再配一套 C# mock 的 UIA 类型，从而在不碰真实桌面的前提下测内核决策逻辑。**这份夹具不进插件包**
+（`package.json` 的 `files` 只含 `lib/`、`mcp-server.mjs`、`cordis.patch.yml`、`README.md`、`CHANGELOG.md`），
+也不影响任何运行时行为。它的隔离来自"输入类型不存在"这一事实，现已加显式断言与逐用例检查。
+
+但必须知道它**不是沙箱**。独立复核用全局键鼠钩子（含阳性对照）实测，以下四条都能让真实输入发生、
+而测试仍然全绿：
+
+| 绕过方式 | 实测后果 |
+|---|---|
+| 自建一个 P/Invoke 类型（如 `[Desk]`）带 `keybd_event` / `mouse_event` | 按键 2 次，守卫不报 |
+| 用字符串拼接构造 COM ProgID（`'WScript'+'.Shell'`） | 按键 4 次，扫描器不匹配 |
+| 把调用写进 `Assert-NoComInput` 剥离自身函数体时跳过的区间 | 单次运行 116 次按键 |
+| 重定义同名函数覆盖真守卫（`IsolationGuard` 自增保留） | 按键 4 次，断言仍通过 |
+
+根因是**所有检测都是黑名单**：查类型名、查方法名、扫文件字面量。黑名单总输给它没想到的名字。
+真正可靠的做法是在抽取时改写源码、把输入调用换成桩（曾实现一半后放弃），但那属于测试基础设施工程，
+收益仅限于"测试更可信"，与插件功能无关。
+
+**判断：不再加固。** 触发前提是有人主动改这个测试文件并引入新输入通道；不改则永不触发。
+代价与收益不成比例。若将来真要彻底解决，方向是 AST 改写而非继续加黑名单——
+关键是别再用"检测"而要用"消除"。
+
+> 复核同时确认：`test/*.mjs` 与 `scripts/*.mjs` 对 `scope` / `HasChildren` / `truncatedByDepth`
+> 的断言一度为零，删掉相关逻辑测试不红。这些已补（`local.11`），`reverse-check` 覆盖 9 项。
+> 但上表四条绕过至今无测试覆盖，也不打算补。
