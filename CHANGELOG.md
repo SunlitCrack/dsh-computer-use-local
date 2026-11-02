@@ -1,5 +1,17 @@
 # 更新记录
 
+## 0.3.2-local.7 — 2026-11-02
+
+- **补完 fixture 白名单，让 P3 的 identity 恢复路径真正可测**：此前白名单停在 `Invoke-Action`，
+  5 个用例自 P3 起一直红；且所有用例都用 `path='` 且不带 identity，恢复路径**一次都没被跑到**。
+- 白名单按性质分开：纯函数加载真实实现（`Find-ElementByIdentity` 只遍历树、`Convert-KeyChord` 只解析按键）；
+  会产生真实输入的（`Invoke-SecondaryAction` / `Invoke-Scroll` / `Invoke-Drag`）改为桩，
+  与既有的 `Invoke-ClickAt` 一致，各自记录被请求的动作。加载真实动作函数会让测试真的移动鼠标。
+- 新增两条用例：路径漂移时按 identity 重新找到元素并在回执标注 `identity-recovered`；
+  identity 也找不到时**明确失败且不点击任何东西**——后者正是 P3 存在的理由。
+- mock 仅补到能表达上述场景（`FindAll`/`FindFirst` 子元素 + 可配置子元素名），仍不发送任何输入。
+  全套测试 55/55。
+
 ## 0.3.2-local.6 — 2026-11-02
 
 - **修正 local.5 引入的新回归**：那次把内核回执转成屏幕坐标的换算写在了 `withPointerMotion`，对**所有** action
