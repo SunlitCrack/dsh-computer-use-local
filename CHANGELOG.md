@@ -1,5 +1,25 @@
 # 更新记录
 
+## 0.3.2-local.11 — 2026-11-02
+
+复核从四个方向攻击隔离守卫，三条穿过去了；均已修复，并各自补了会红的用例。
+
+- **守卫原本只在加载期跑一次**：在其后追加一行 `Add-Type -AssemblyName System.Windows.Forms`，
+  守卫依然「通过」，而 `Invoke-Action` 向焦点窗口真的发出了 4 次按键，测试同时报 16/16 全绿。
+  现改为**每个用例执行前**都检查（由 `Capture-Outcome` 调用），并有用例断言它运行次数 >1——
+  只在加载期跑一次的检查与注释无异。
+- **只查了 4 个方法名**：真实 `CuNative` 通过 `SetCursorPos` 移指针、`keybd_event` 发按键，两者都不在原名单里
+  （实测：mock 带上 `SetCursorPos` 后产生 4 次真实鼠标事件）。改为枚举 mock 的**实际方法**而非信任名单，
+  并用 `GetMethods()`——`GetMethod(name)` 遇重载会抛 `AmbiguousMatchException`，原先的 `catch {}` 把它变成了静默通过。
+- **COM 是类型检查看不见的通道**：晚绑定的 Windows Script Host Shell 对象无需加载程序集即可发按键。
+  内核目前完全不使用 COM（已核实），所以这是防将来误用；夹具若引用该路径将拒绝加载，
+  扫描自身源码时会先剥掉守卫函数本身，避免匹配到自己。
+- 修正 `TreeScope` 判断：`Subtree` 含 `Element`，故 `scope & (Children|Descendants|Subtree)` 会让
+  单独的 `Element` 也返回子元素。真实 UIA 中 `Element` 就是元素自身，返回空。现只判断 `Children|Descendants`。
+
+三个新机制各配一条用例，均已反向验证：删掉守卫、删掉 `HasChildren` 门、删掉禁用名单，
+都会让**具名用例**变红而非保持绿色。`reverse-check` 现覆盖 9 项，全套测试 59/59。
+
 ## 0.3.2-local.10 — 2026-11-02
 
 复核指出夹具提供的保证比看上去弱，两处均已加固：
