@@ -1,5 +1,20 @@
 # 更新记录
 
+## 0.3.2-local.6 — 2026-11-02
+
+- **修正 local.5 引入的新回归**：那次把内核回执转成屏幕坐标的换算写在了 `withPointerMotion`，对**所有** action
+  生效，但 P4 只改了 click 的三个 return。`scroll`/`drag` 的回执本来就是屏幕坐标（`$pt`/`$pt2`），
+  被多加了窗口原点。现在只对 click 换算。
+- 补 `scroll`/`drag` 两条用例：这两个 action 此前**完全没有覆盖**，所以上面的回归才漏过去。
+- **新增 `scripts/reverse-check.mjs`**：把每项修复在临时副本里逐个回退，断言测试会变红。
+  六项修复全部验证为「有保护力」——没有这一步，「测试通过」并不能说明修复真的被锁住。
+- 把 `test/output-schema.test.mjs` 加入 `npm test`：此前它没被任何脚本引用，`npm test` 只跑到 43 条，
+  新用例默认不执行。
+- `@deepseek-ai/dsh-tools` 声明进 `devDependencies`：新用例从它导入 `validateJsonSchemaValue`，
+  干净 clone 下此前无解析路径。全套测试现为 53/53。
+- 说明：`Click FAILED` 分支经 `execute()` 不可达（`ps1.js` 在 `ok:false` 时先 reject），
+  用例改为直接校验 render 契约，不再假装测试该路径。
+
 ## 0.3.2-local.5 — 2026-11-02
 
 - **修复琥珀落点环偏移一个窗口原点**（P4 回归，高危）：`withPointerMotion` 把内核回执的 `x/y` 直接当屏幕坐标
