@@ -1,5 +1,23 @@
 # 更新记录
 
+## 0.3.2-local.5 — 2026-11-02
+
+- **修复琥珀落点环偏移一个窗口原点**（P4 回归，高危）：`withPointerMotion` 把内核回执的 `x/y` 直接当屏幕坐标
+  传给 `session.recordAction`，而 P4 已把内核 `x/y` 改为窗口相对，`recordAction` 又减一次原点。
+  实测：窗口原点 `(120,120)`、点击 `(400,600)`，环画在 `(280,480)`，偏差正好是原点。
+  现在先经快照 bounds 换算回屏幕坐标。
+- `click` 的 output schema 补 `error` 字段；`ok:false` 时回执改为 `Click FAILED (<via>) — <error>`，
+  不再以 `Clicked (...)` 开头，避免「被拒绝的动作」读起来像成功。
+- 兜底删 null 时跳过 `required` 字段：删掉 `ok` 会把「校验失败」变成「缺必填字段」，更难诊断。
+- **新增 `test/output-schema.test.mjs`（7 个用例）**：此前 `test/` 与 `scripts/` 从未用 `output.schema`
+  校验过任何工具输出，所以 `note: null` 才能潜伏到线上。用真实 PowerShell 边界 mock 驱动 `execute()`，
+  并调用宿主自己的 `validateJsonSchemaValue`：覆盖 null note、坐标去重两种形态、未吸附 marker、
+  琥珀落点、被拒绝的点击、required 字段保护。
+- 修 `test/fixtures/kernel-safety.ps1` 的函数白名单：它停留在 P3 之前，缺 `Test-ElementIdentity` /
+  `Get-ElementIdentity`，导致 5 个用例自 P3 落地起一直红（在 `60d132e`、`e6cc5a7`、`04d00c9` 上均复现）。
+  全套测试现为 50/50。
+
+
 ## 0.3.2-local.4 — 2026-11-02
 
 - **修正 0.3.2-local.2 的无效修复**：去重条件要求 coordinateSpace === captureSpace，但
@@ -9,6 +27,8 @@
 
 ## 0.3.2-local.3 — 2026-11-02
 
+> **更正（0.3.2-local.4）**：本条的坐标去重实际未生效——条件要求 `coordinateSpace === captureSpace`，但前者恒为 `window`、后者在 `modelScale==1` 时为 `screenshot`，两者永不相等，回执仍在重复。已在 `0.3.2-local.4` 改为只比较坐标数值。本条描述保留原样，仅作历史记录。
+
 - **修复 `element_index` 点击完全不可用**：内核在普通点击路径返回 `note: null`（`uia.ps1` 在漂移检查前
   把 `$note` 置为 `$null`），而 `click` 的 output schema 把 `note` 声明为 string 且
   `additionalProperties: false`，于是每次按索引点击都失败：
@@ -17,6 +37,8 @@
   避免将来任何可空的内核字段再次拖垮整次调用。
 
 ## 0.3.2-local.2 — 2026-11-02
+
+> **更正（0.3.2-local.4）**：本条的坐标去重实际未生效——条件要求 `coordinateSpace === captureSpace`，但前者恒为 `window`、后者在 `modelScale==1` 时为 `screenshot`，两者永不相等，回执仍在重复。已在 `0.3.2-local.4` 改为只比较坐标数值。本条描述保留原样，仅作历史记录。
 
 - click 回执不再重复同一个坐标：modelScale 为 1（常态）时 x/y 与 captureX/Y 是同一个窗口相对点，
   之前输出 t window (87, 103) = window (87, 103)。现在两点一致时只说一次，仅在截图被降采样、
