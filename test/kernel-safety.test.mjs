@@ -74,3 +74,21 @@ test('the explicit observation activation opt-out still works', windowsOnly, () 
   assert.equal(cases.observeWithoutActivation.result.ok, true);
   assert.equal(cases.observeWithoutActivation.result.window.foreground, false);
 });
+
+// P3's recovery path. Before Find-ElementByIdentity became loadable in the
+// fixture, no case could reach it: every other case passes path='' with no
+// identity, so the whole feature was untested.
+test('a drifted path falls back to the element identity and says so', windowsOnly, () => {
+  assert.equal(cases.identityRecovery.error, null);
+  assert.equal(cases.identityRecovery.result.ok, true);
+  assert.match(cases.identityRecovery.result.note ?? '', /identity-recovered/,
+    'the caller must be told the click moved to a re-found element');
+});
+
+test('an identity that matches nothing fails instead of clicking a neighbour', windowsOnly, () => {
+  // The dangerous outcome is acting on whatever now sits at the stale path and
+  // reporting success; P3 exists to make that impossible.
+  assert.match(cases.identityMissing.error ?? '', /no longer resolves/);
+  assert.equal(cases.identityMissing.result, null);
+  assert.deepEqual(cases.identityMissing.pointerCalls, [], 'nothing may be clicked');
+});

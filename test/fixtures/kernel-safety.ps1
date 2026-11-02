@@ -23,6 +23,10 @@ namespace System.Windows.Automation {
     public static int InvokeCount;
     public static long LastInvokedHwnd;
     public static List<long> Lookups = new List<long>();
+    // Identity-recovery cases need a tree where the positional path is dead but
+    // a named element exists. When set, children are produced under this name
+    // so Find-ElementByIdentity has something to match; null means "no match".
+    public static string IdentityChildName;
     public static TestElement FromHandle(IntPtr h) {
       Lookups.Add(h.ToInt64());
       if (h.ToInt64() == 101 && (FailRequestedWindow || FailuresRemaining-- > 0))
@@ -40,8 +44,30 @@ namespace System.Windows.Automation {
   public class TestElement {
     public TestCurrent Current;
     public TestElement(long hwnd) { Current = new TestCurrent { NativeWindowHandle = hwnd }; }
+    public TestElement(long hwnd, string name) {
+      Current = new TestCurrent { NativeWindowHandle = hwnd, Name = name, AutomationId = name };
+    }
     public object[] GetSupportedPatterns() { return new object[] { InvokePattern.Pattern }; }
     public TestInvoke GetCurrentPattern(object pattern) { return new TestInvoke(Current.NativeWindowHandle); }
+    // Identity lookup walks children; expose the configured child (if any) so a
+    // recovery case has a tree to search instead of an empty stub.
+    public ChildCollection FindAll(TreeScope scope, Condition condition) {
+      var items = new List<TestElement>();
+      if (!string.IsNullOrEmpty(AutomationElement.IdentityChildName))
+        items.Add(new TestElement(Current.NativeWindowHandle, AutomationElement.IdentityChildName));
+      return new ChildCollection(items);
+    }
+    public TestElement FindFirst(TreeScope scope, Condition condition) {
+      if (!string.IsNullOrEmpty(AutomationElement.IdentityChildName))
+        return new TestElement(Current.NativeWindowHandle, AutomationElement.IdentityChildName);
+      return null;
+    }
+  }
+  public enum TreeScope { Children, Descendants }
+  public class Condition { public static readonly Condition TrueCondition = new Condition(); }
+  public class ChildCollection : List<TestElement> {
+    public ChildCollection() { }
+    public ChildCollection(IEnumerable<TestElement> items) : base(items) { }
   }
   public class TestInvoke {
     long hwnd;
@@ -58,10 +84,16 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile(
   (Resolve-Path -LiteralPath $kernelPath).Path, [ref]$parseTokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw 'Kernel parse failed' }
 $functions = @('Fail', 'Resolve-ElementByPath', 'Get-AutomationRoot', 'Invoke-Action', 'Invoke-GetState',
-  # P3 added element-identity handling: Invoke-Action now calls this helper, so
-  # the fixture must load it or every case dies with "Test-ElementIdentity is
-  # not recognized" (5 cases were red from P3 until this line).
-  'Test-ElementIdentity', 'Get-ElementIdentity')
+  # P3 added element-identity handling: Invoke-Action calls these, so the fixture
+  # must load them or every case dies with "Test-ElementIdentity is not
+  # recognized" (5 cases were red from P3 until this line).
+  'Test-ElementIdentity', 'Get-ElementIdentity',
+  # Recovering a drifted path by identity needs this lookup. It is pure (walks
+  # the tree, returns an element), so the real implementation is safe to load --
+  # without it the P3 recovery path could not be exercised at all.
+  'Find-ElementByIdentity',
+  # Pure key-chord parsing; no input is sent.
+  'Convert-KeyChord')
 foreach ($definition in $ast.FindAll({ param($node)
   $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
 }, $true)) {
@@ -87,6 +119,26 @@ function Invoke-TypeText {
   $script:TypedInto = [CuNative]::GetForegroundWindow().ToInt64()
   return $null
 }
+# Action helpers Invoke-Action calls that would otherwise reach real input.
+# Stubbed (not loaded from the kernel) for the same reason Invoke-ClickAt is:
+# the point is to test the decision logic, not to drive the desktop. Each one
+# records what it was asked to do so a case can assert on it.
+function Invoke-SecondaryAction {
+  param($element, $action)
+  $script:SecondaryCalls += @{ action = $action }
+  return @{ ok = $true; via = "$action" + 'Pattern' }
+}
+function Invoke-Scroll {
+  param($x, $y, $direction, $amount)
+  $script:ScrollCalls += @{ x = $x; y = $y; direction = $direction; amount = $amount }
+}
+function Invoke-Drag {
+  param($fromX, $fromY, $toX, $toY, $button)
+  $script:DragCalls += @{ fromX = $fromX; fromY = $fromY; toX = $toX; toY = $toY; button = $button }
+}
+# Pure: turns a key chord into vk codes. Loading the real one is harmless and
+# keeps the fixture honest about what the kernel does with key syntax.
+
 function Reset-Fixture {
   [CuNative]::Foreground = [IntPtr]101
   [CuNative]::AlternateLookups = 0
@@ -100,6 +152,9 @@ function Reset-Fixture {
   $script:ActivationAttempts = 0
   $script:TypedInto = 0
   $script:PointerCalls = @()
+  $script:SecondaryCalls = @()
+  $script:ScrollCalls = @()
+  $script:DragCalls = @()
 }
 function Capture-Outcome([scriptblock]$work) {
   try { return @{ result = (& $work); error = $null } }
@@ -171,4 +226,34 @@ $cases.observationRejected = Capture-Outcome {
 $cases.observeWithoutActivation = Capture-Outcome {
   Invoke-GetState ([pscustomobject]@{ app = 'fixture'; includeScreenshot = $false; maxDepth = 0; annotate = @{ activate = $false } })
 }
+
+# P3 recovery path: the snapshot's positional path no longer resolves, but the
+# element identity still matches, so the action must be re-found by identity and
+# report that it recovered -- never silently act on whatever now sits at the path.
+# This is the case the fixture could not express before Find-ElementByIdentity
+# was loadable, which is why the whole path was untested.
+Reset-Fixture
+[System.Windows.Automation.AutomationElement]::IdentityChildName = 'safeButton'
+$cases.identityRecovery = Capture-Outcome {
+  Invoke-Action ([pscustomobject]@{
+    action = 'click'; app = 'fixture'; snapshot_hwnd = 101
+    path = '9.9.9.9'
+    element_identity = @{ name = 'safeButton'; automationId = 'safeButton'; role = 'Button' }
+  })
+}
+$cases.identityRecovery.pointerCalls = @($script:PointerCalls)
+
+# Identity that resolves to nothing must fail loudly instead of clicking a
+# neighbour -- P3's whole reason for existing.
+Reset-Fixture
+[System.Windows.Automation.AutomationElement]::IdentityChildName = $null
+$cases.identityMissing = Capture-Outcome {
+  Invoke-Action ([pscustomobject]@{
+    action = 'click'; app = 'fixture'; snapshot_hwnd = 101
+    path = '9.9.9.9'
+    element_identity = @{ name = 'ghost'; automationId = 'ghost'; role = 'Button' }
+  })
+}
+$cases.identityMissing.pointerCalls = @($script:PointerCalls)
+
 $cases | ConvertTo-Json -Depth 12 -Compress
