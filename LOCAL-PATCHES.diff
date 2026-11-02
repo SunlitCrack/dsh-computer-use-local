@@ -1581,14 +1581,14 @@ index 1c0bafe..85c7218 100644
  });
  setAuditEnabled(config.audit !== false);
 diff --git a/package.json b/package.json
-index 7bcb342..fdb8445 100644
+index 7bcb342..9fa2159 100644
 --- a/package.json
 +++ b/package.json
 @@ -1,6 +1,6 @@
  {
    "name": "@milkuovo/dsh-computer-use",
 -  "version": "0.3.1",
-+  "version": "0.3.2-local.9",
++  "version": "0.3.2-local.10",
    "description": "Codex Computer Use for DeepSeek Harness on Windows: screenshot + UI Automation tree + mouse/keyboard actions, aligned with the official 10-method Codex Computer Use tool surface. Registers as the exclusive provider on the official DSH 0.1.7+ computer-use seam when present. Includes a zero-dependency stdio MCP server.",
    "type": "module",
    "main": "lib/index.js",

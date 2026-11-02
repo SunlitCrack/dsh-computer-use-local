@@ -63,6 +63,25 @@ const cases = [
     from: /,\r?\n\s*# Recovering a drifted path by identity needs this lookup[\s\S]*?'Find-ElementByIdentity',/,
     to: ',',
   },
+  {
+    // Removing the guard is what a future "just make set_value testable" edit
+    // would do; a test must notice, or the guard is decoration.
+    name: 'fixture isolation guard runs per case',
+    test: 'test/kernel-safety.test.mjs',
+    file: 'test/fixtures/kernel-safety.ps1',
+    from: /^  \$null = Assert-Isolation$/m,
+    to: '  # removed',
+  },
+  {
+    name: 'mock honours HasChildren',
+    test: 'test/kernel-safety.test.mjs',
+    file: 'test/fixtures/kernel-safety.ps1',
+    from: /if \(!AutomationElement\.HasChildren\) return new ChildCollection\(items\);/,
+    to: '/* removed */',
+    also: [
+      { from: /if \(!AutomationElement\.HasChildren\) return null;/, to: '/* removed */' },
+    ],
+  },
 ];
 
 /** Run the suite in `dir` and return the names of failing CASES (not files). */

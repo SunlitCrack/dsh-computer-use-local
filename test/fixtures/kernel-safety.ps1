@@ -69,7 +69,10 @@ namespace System.Windows.Automation {
     // always true, which is what the lazy-tree retry keys on.
     public ChildCollection FindAll(TreeScope scope, Condition condition) {
       var items = new List<TestElement>();
-      if ((scope & (TreeScope.Children | TreeScope.Descendants | TreeScope.Subtree)) == 0)
+      // Only Children and Descendants ask for children. Subtree = 7 includes
+      // Element(1), so testing Subtree too made a bare Element scope return a
+      // child -- real UIA returns nothing for Element (it is the element itself).
+      if ((scope & (TreeScope.Children | TreeScope.Descendants)) == 0)
         return new ChildCollection(items);
       if (!AutomationElement.HasChildren) return new ChildCollection(items);
       // Drift shape: ordinal 0 is a decoy (wrong identity, but the path still
@@ -87,7 +90,10 @@ namespace System.Windows.Automation {
       return new ChildCollection(items);
     }
     public TestElement FindFirst(TreeScope scope, Condition condition) {
-      if ((scope & (TreeScope.Children | TreeScope.Descendants | TreeScope.Subtree)) == 0)
+      // Only Children and Descendants ask for children. Subtree = 7 includes
+      // Element(1), so testing Subtree too made a bare Element scope return a
+      // child -- real UIA returns nothing for Element (it is the element itself).
+      if ((scope & (TreeScope.Children | TreeScope.Descendants)) == 0)
         return null;
       if (!AutomationElement.HasChildren) return null;
       if (!string.IsNullOrEmpty(AutomationElement.DriftDecoyName))
@@ -139,43 +145,108 @@ foreach ($definition in $ast.FindAll({ param($node)
 }
 
 # --- isolation guard -------------------------------------------------------
-# The kernel sends real input through [CuInput] and [System.Windows.Forms
-# .SendKeys], and screenshots through [System.Drawing]. None of those exist here
-# because extraction runs only FUNCTION BODIES: the top-level Add-Type lines that
-# define them never execute.
+# What keeps this fixture from typing into real windows is that the kernel's
+# input types simply do not exist here: extraction runs only FUNCTION BODIES, so
+# the top-level Add-Type / Add-Type -AssemblyName lines in lib/uia.ps1 never
+# execute, and [CuInput], [System.Windows.Forms.SendKeys] and [System.Drawing]
+# are absent.
 #
-# That is an accident of this design, not a decision -- and a dangerous one. Add
-# one `Add-Type -AssemblyName System.Windows.Forms` here (say, to make set_value
-# testable) and the loaded Invoke-Action would start typing into real windows
-# while the suite still reported green. Fail loudly instead.
+# That is an accident, not a decision, so it is asserted explicitly. Two lessons
+# from review are baked in:
 #
-# CuNative is deliberately NOT on this list: this fixture defines its own
-# CuNative mock (queries only). The real one in lib/uia.ps1 additionally carries
-# keybd_event. Capability is checked below instead of trusting the name.
-$forbidden = @(
-  'CuInput',                       # SendMouse / SendKey / SendUnicode
+#   1. Checking ONCE at load time is not enough. Appending an Add-Type after this
+#      block loaded the assembly with the guard already satisfied, and the suite
+#      stayed green while Invoke-Action typed into the real desktop (measured:
+#      4 key events). The check therefore runs before EVERY case, via
+#      Assert-Isolation below, called from Capture-Outcome.
+#   2. A name list is not enough either. The real CuNative carries SetCursorPos
+#      and keybd_event; a mock that grew SetCursorPos would pass a four-name
+#      check and still move the real pointer (measured: 4 mouse events). What
+#      matters is the CAPABILITY, so every public method on the mock is inspected
+#      and any input-shaped name is rejected -- and the inspection uses
+#      GetMethods(), because GetMethod(name) throws AmbiguousMatchException on
+#      overloads and the old `catch {}` turned that into a silent pass.
+$script:ForbiddenTypes = @(
+  'CuInput',                       # SendMouse / SendKey / SendUnicode / VkFromChar
   'System.Windows.Forms.SendKeys', # SendWait
   'System.Drawing.Bitmap'          # CopyFromScreen target
 )
-foreach ($name in $forbidden) {
-  $available = $false
-  try { $null = [type]$name; $available = $true } catch { }
-  if ($available) {
-    throw ("fixture isolation broken: [$name] is available in this process, so the loaded kernel " +
-      'could send real input or capture the real screen. Do not load those assemblies here; stub the ' +
-      'helper instead (see Invoke-ClickAt / Invoke-Scroll).')
+$script:ForbiddenMembers = @(
+  # Anything that could move the pointer, press a key, or paste.
+  'keybd_event', 'mouse_event', 'SendInput', 'SetCursorPos',
+  'SendKey', 'SendUnicode', 'SendMouse', 'SendKeys', 'SendWait', 'CopyFromScreen'
+)
+
+# ComSentKeys: a COM-based bypass that the type checks above cannot see.
+# through a late-bound COM object: no assembly is loaded, no PowerShell type
+# appears, and the kernel itself never uses COM today (verified) -- so this is a
+# guard against a FUTURE edit, not a live hole.
+#
+# The check is a source scan, not a runtime probe, on purpose: creating the COM
+# object just to see whether it exists would itself be a side effect, and this
+# machine can create it (verified), so a probe would abort every run here.
+function Assert-NoComInput {
+  $source = [System.IO.File]::ReadAllText($PSCommandPath)
+  # Strip this function's own body first: the patterns below are string literals
+  # that live in the file being scanned, so a naive scan always matches itself.
+  $marker = 'function Assert-NoComInput'
+  $start = $source.IndexOf($marker)
+  if ($start -ge 0) {
+    $end = $source.IndexOf("`nfunction Assert-Isolation", $start)
+    if ($end -gt $start) {
+      $source = $source.Substring(0, $start) + $source.Substring($end)
+    }
   }
-}
-# The mock CuNative must stay query-only. If it ever grows an input method, the
-# loaded kernel could call it and really press keys.
-foreach ($member in @('keybd_event', 'SendKey', 'SendUnicode', 'SendMouse')) {
-  $has = $false
-  try { $has = $null -ne ([CuNative].GetMethod($member)) } catch { }
-  if ($has) {
-    throw "fixture isolation broken: the mock [CuNative] exposes '$member'; it must stay query-only."
+  $patterns = @(
+    'New-Object\s+-ComObject\s+WScript\.Shell',
+    'WScript\.Shell',
+    "InvokeMember\s*\(\s*'SendKeys'",
+    "InvokeMember\s*\(\s*`"SendKeys`""
+  )
+  foreach ($pattern in $patterns) {
+    if ($source -match $pattern) {
+      throw ("fixture isolation broken: this fixture references COM input ($pattern). " +
+        'WScript.Shell SendKeys sends real keystrokes through late binding -- the type checks ' +
+        'cannot see it, so it is banned outright.')
+    }
   }
+  return 'ok'
 }
-$script:IsolationGuard = 'ok'
+
+function Assert-Isolation {
+  # Count every invocation. A guard whose removal no test notices is a comment;
+  # the counter is what lets a case prove the check actually RAN rather than
+  # merely having been written.
+  $script:IsolationRuns = 1 + [int]$script:IsolationRuns
+  $null = Assert-NoComInput
+  foreach ($name in $script:ForbiddenTypes) {
+    $available = $false
+    try { $null = [type]$name; $available = $true } catch { }
+    if ($available) {
+      throw ("fixture isolation broken: [$name] is available in this process, so the loaded kernel " +
+        'could send real input or capture the real screen. Do not load those assemblies here; stub ' +
+        'the helper instead (see Invoke-ClickAt / Invoke-Scroll).')
+    }
+  }
+  # Capability, not name: enumerate every method the mock exposes. GetMethod(name)
+  # is not usable here -- it throws on overloads and the exception used to be
+  # swallowed, letting an input method survive the check.
+  $methods = @([CuNative].GetMethods() | ForEach-Object { $_.Name })
+  foreach ($member in $script:ForbiddenMembers) {
+    if ($methods -contains $member) {
+      throw ("fixture isolation broken: the mock [CuNative] exposes '$member'; it must stay " +
+        'query-only, or the loaded kernel could send real input through it.')
+    }
+  }
+  # A non-mock CuNative would mean lib/uia.ps1's own definition leaked in.
+  if (@($methods).Count -gt 0 -and $methods -notcontains 'GetForegroundWindow') {
+    throw 'fixture isolation broken: [CuNative] is not this fixture''s mock (missing GetForegroundWindow).'
+  }
+  return 'ok'
+}
+
+# Fail fast at load time too, so an obvious mistake aborts before the cases run.
+$script:IsolationGuard = Assert-Isolation
 
 function Start-Sleep { param($Milliseconds) }
 function Resolve-Window { param($target) return [IntPtr]101 }
@@ -239,6 +310,12 @@ function Reset-Fixture {
   [System.Windows.Automation.AutomationElement]::HasChildren = $true
 }
 function Capture-Outcome([scriptblock]$work) {
+  # Isolation is asserted before EVERY case, not once at load: an Add-Type added
+  # later in this file would otherwise load an input assembly after the guard had
+  # already passed (measured: 4 real key events while the suite was green).
+  # Deliberately outside the try -- this must abort the run, not become a case's
+  # error field that a test could assert around.
+  $null = Assert-Isolation
   try { return @{ result = (& $work); error = $null } }
   catch { return @{ result = $null; error = $_.Exception.Message } }
 }
@@ -367,5 +444,45 @@ $cases.identityDriftUnrecoverable = Capture-Outcome {
   })
 }
 $cases.identityDriftUnrecoverable.pointerCalls = @($script:PointerCalls)
+
+# The isolation guard is only worth having if a test would notice its absence.
+# Report what it inspected so a case can assert on it, and assert here that a
+# deliberately broken configuration is actually rejected -- a guard that cannot
+# fail is a comment.
+$cases.isolation = @{
+  status = $script:IsolationGuard
+  # How many times the guard actually executed. Capture-Outcome calls it before
+  # every case, so a suite this size must show many runs; 0 or 1 means the check
+  # is not wired in (or ran only at load, which an added Add-Type would outrun).
+  runs = [int]$script:IsolationRuns
+  caseCount = $cases.Count
+  forbiddenTypes = @($script:ForbiddenTypes)
+  forbiddenMembers = @($script:ForbiddenMembers)
+  # Prove the detector fires: re-run the member scan against a name that is
+  # definitely present, and report whether it was caught.
+  detectsPresentMember = $false
+}
+try {
+  $methods = @([CuNative].GetMethods() | ForEach-Object { $_.Name })
+  $cases.isolation.detectsPresentMember = $methods -contains 'GetForegroundWindow'
+} catch { }
+
+# HasChildren=false must change the kernel's leaf-vs-truncated decision, or the
+# flag is inert and the mock is still claiming "children" for every node.
+Reset-Fixture
+[System.Windows.Automation.AutomationElement]::HasChildren = $false
+[System.Windows.Automation.AutomationElement]::IdentityChildName = 'childNode'
+$cases.leafNode = Capture-Outcome {
+  Invoke-GetState ([pscustomobject]@{ app = 'fixture'; includeScreenshot = $false; maxDepth = 1; annotate = @{ activate = $false } })
+}
+$cases.leafNode.truncatedByDepth = $cases.leafNode.result.truncatedByDepth
+
+Reset-Fixture
+[System.Windows.Automation.AutomationElement]::HasChildren = $true
+[System.Windows.Automation.AutomationElement]::IdentityChildName = 'childNode'
+$cases.branchNode = Capture-Outcome {
+  Invoke-GetState ([pscustomobject]@{ app = 'fixture'; includeScreenshot = $false; maxDepth = 1; annotate = @{ activate = $false } })
+}
+$cases.branchNode.truncatedByDepth = $cases.branchNode.result.truncatedByDepth
 
 $cases | ConvertTo-Json -Depth 12 -Compress

@@ -111,3 +111,37 @@ test('a drifted path with nothing to recover fails and clicks nothing', windowsO
   assert.equal(cases.identityDriftUnrecoverable.result, null);
   assert.deepEqual(cases.identityDriftUnrecoverable.pointerCalls, [], 'nothing may be clicked');
 });
+
+// The fixture keeps the kernel away from real input by not loading the input
+// types at all. That is an accident of loading only function bodies, so it is
+// asserted -- and these cases are what make the assertion load-bearing: remove
+// the guard and they fail rather than the suite staying green while Invoke-Action
+// types into whatever window is focused.
+test('the fixture asserts it cannot reach real input', windowsOnly, () => {
+  assert.equal(cases.isolation.status, 'ok');
+  assert.ok(cases.isolation.forbiddenTypes.includes('CuInput'), 'CuInput must be banned');
+  assert.ok(cases.isolation.forbiddenTypes.includes('System.Windows.Forms.SendKeys'), 'SendKeys must be banned');
+  assert.ok(cases.isolation.forbiddenMembers.includes('SetCursorPos'),
+    'the real CuNative moves the pointer through SetCursorPos');
+  assert.ok(cases.isolation.forbiddenMembers.includes('keybd_event'),
+    'the real CuNative presses keys through keybd_event');
+  // A detector that cannot fire proves nothing; confirm it sees a member that is
+  // definitely on the mock.
+  assert.equal(cases.isolation.detectsPresentMember, true,
+    'the member scan must be capable of finding a present member');
+  // And it must actually RUN per case. A load-time-only check is outrun by any
+  // Add-Type added later in the file, which is how the first version of this
+  // guard passed while the kernel typed into the real desktop.
+  assert.ok(cases.isolation.runs > 1,
+    `the guard must run before every case; it ran ${cases.isolation.runs} time(s)`);
+});
+
+// HasChildren decides whether the mock claims children for a node. Without it
+// every node answers "yes, children", so the kernel's leaf-at-depth-limit check
+// is always true and truncatedByDepth becomes meaningless.
+test('a node that reports no children is not counted as truncated', windowsOnly, () => {
+  assert.equal(cases.leafNode.truncatedByDepth, false,
+    'a leaf at the depth limit has nothing below it to lose');
+  assert.equal(cases.branchNode.truncatedByDepth, true,
+    'a node WITH children at the depth limit is genuinely truncated');
+});
