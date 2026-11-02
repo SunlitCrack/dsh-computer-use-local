@@ -1,5 +1,14 @@
 # 更新记录
 
+## 0.3.2-local.3 — 2026-11-02
+
+- **修复 `element_index` 点击完全不可用**：内核在普通点击路径返回 `note: null`（`uia.ps1` 在漂移检查前
+  把 `$note` 置为 `$null`），而 `click` 的 output schema 把 `note` 声明为 string 且
+  `additionalProperties: false`，于是每次按索引点击都失败：
+  `tool "click" returned invalid output: "value.note" must be a string`。
+  marker 路径因为会用吸附判定覆盖 `note` 而侥幸正常。现从合并结果中删除 null 键，
+  避免将来任何可空的内核字段再次拖垮整次调用。
+
 ## 0.3.2-local.2 — 2026-11-02
 
 - click 回执不再重复同一个坐标：modelScale 为 1（常态）时 x/y 与 captureX/Y 是同一个窗口相对点，
