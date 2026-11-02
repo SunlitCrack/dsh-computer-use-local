@@ -57,7 +57,11 @@ $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
   (Resolve-Path -LiteralPath $kernelPath).Path, [ref]$parseTokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw 'Kernel parse failed' }
-$functions = @('Fail', 'Resolve-ElementByPath', 'Get-AutomationRoot', 'Invoke-Action', 'Invoke-GetState')
+$functions = @('Fail', 'Resolve-ElementByPath', 'Get-AutomationRoot', 'Invoke-Action', 'Invoke-GetState',
+  # P3 added element-identity handling: Invoke-Action now calls this helper, so
+  # the fixture must load it or every case dies with "Test-ElementIdentity is
+  # not recognized" (5 cases were red from P3 until this line).
+  'Test-ElementIdentity', 'Get-ElementIdentity')
 foreach ($definition in $ast.FindAll({ param($node)
   $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
 }, $true)) {
