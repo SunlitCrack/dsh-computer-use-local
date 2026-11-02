@@ -60,11 +60,13 @@ function assertSchema(tool, value, label) {
   assert.deepEqual(violations, [], `${label}: output violates output.schema -> ${JSON.stringify(violations)}`);
 }
 
-/** The reply the scripted kernel will send for the next click. */
+/** The reply the scripted kernel will send for the next action. */
 let nextReply = { ok: true, via: 'coordinate', x: 0, y: 0 };
 const mock = installPowerShellMock({
   onRequest(request) {
-    if (request.proc.kind === 'kernel' && request.payload.action === 'click') {
+    // Answer every action the tests drive (click/scroll/drag); an unanswered
+    // request would sit until the 45s kernel timeout.
+    if (request.proc.kind === 'kernel' && request.payload.action) {
       mock.reply(request, nextReply);
     }
   },
@@ -175,4 +177,51 @@ test('a null required field is not silently deleted', async () => {
     reply: { ok: null, via: 'element', x: 1, y: 2 },
   });
   assert.ok('ok' in value, 'ok must survive the null sweep');
+});
+
+test('scroll does not shift the recorded point: its receipt is already screen space', async () => {
+  // P4 only converted the CLICK receipts to window-relative pixels; scroll and
+  // drag still return the screen point. Converting them too moved the recorded
+  // landing point by one window origin in the opposite direction.
+  const session = fixtureSession();
+  nextReply = { ok: true, via: 'mouse wheel', direction: 'down', pages: 1, x: 520, y: 720 };
+  const tools = buildFixtureTools(session);
+  const value = await tools.scroll.execute(
+    { app: 'fixture', direction: 'down', pages: 1, x: 520, y: 720 },
+    { agent: {}, callId: 'test' },
+  );
+  assertSchema(tools.scroll, value, 'scroll');
+  assert.deepEqual(session.lastScreenPoint, { x: 520, y: 720 },
+    'a screen-space receipt must be recorded as-is');
+  assert.equal(session.lastAction.x, 520 - WINDOW.x, 'screenshot point = screen - origin');
+  assert.equal(session.lastAction.y, 720 - WINDOW.y, 'screenshot point = screen - origin');
+});
+
+test('drag does not shift the recorded point either', async () => {
+  const session = fixtureSession();
+  nextReply = { ok: true, via: 'SendInput drag', x: 700, y: 800 };
+  const tools = buildFixtureTools(session);
+  const value = await tools.drag.execute(
+    { app: 'fixture', from_x: 300, from_y: 400, to_x: 700, to_y: 800 },
+    { agent: {}, callId: 'test' },
+  );
+  assertSchema(tools.drag, value, 'drag');
+  assert.deepEqual(session.lastScreenPoint, { x: 700, y: 800 },
+    'a screen-space receipt must be recorded as-is');
+});
+
+test('the FAILED receipt branch renders when a result carries ok:false', async () => {
+  // ps1.js rejects ok:false before it reaches render, so this branch is not
+  // reachable through execute() today. It is still the correct rendering for any
+  // future caller that hands render a refused result, so pin its text.
+  const { text } = await (async () => {
+    const tools = buildFixtureTools(fixtureSession());
+    const rendered = tools.click.output.render({}, {
+      ok: false, via: 'element', x: 1, y: 2, error: 'element is disabled',
+      observationRequired: true,
+    }).map((b) => b.text ?? '').join('');
+    return { text: rendered };
+  })();
+  assert.match(text, /Click FAILED/, `a refused result must not read as a click, got: ${text}`);
+  assert.match(text, /element is disabled/, 'the error must be surfaced');
 });
