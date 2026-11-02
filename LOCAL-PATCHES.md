@@ -1,12 +1,20 @@
 # 本地补丁（独立维护线，基线 npm `@milkuovo/dsh-computer-use@0.3.1`）
 
-这条独立维护线只做一件事：把本机实测到的 5 个缺陷修掉。上游代码结构、工具面（10 个工具）、
-配置项、cordis 装配方式都没动，所以它仍然是「一个 DSH 插件 + 一份 cordis patch」。
+这条独立维护线只做一件事：把本机实测到的缺陷修掉，不动上游的代码结构、工具面（10 个工具）、
+配置项与 cordis 装配方式，所以它仍然是「一个 DSH 插件 + 一份 cordis patch」。
+
+迭代分两批：**P1–P5**（`0.3.1-local.1`）修「点了会点错」；**P6–P13**（`0.3.2-local.1`）修
+「根本点不到、且失败看不出来」及其后续回归；`0.3.2-local.2` 起的测试补强见文末「发布历史」。
 
 - 基线：git `b85ecf2`（`release: 0.3.1`），npm 0.3.1
-- 生成方式：`git diff > LOCAL-PATCHES.diff`（该文件与本说明一起留在工作区，未提交）
+- 生成方式（**每次发版后重跑**，否则这份 diff 会落后于代码，照它回滚会丢掉新修复）：
+  ```powershell
+  git diff b85ecf2 HEAD -- lib/ mcp-server.mjs cordis.patch.yml README.md package.json > LOCAL-PATCHES.diff
+  ```
+  该文件与本说明都是**已提交**的发布物（不是未入库的本地草稿）。
 - 验证脚本：`node scripts/local-verify.mjs --title <窗口标题片段>`（需要真实桌面会话）
 - 复现脚本：`node scripts/local-repro.mjs --title <窗口标题片段>`（打印 list_apps / 名字解析 / 索引映射）
+- 反向验证：`node scripts/reverse-check.mjs`（把每项修复在临时副本里回退，断言对应测试会变红）
 
 | # | 位置 | 症状（本机实测） | 修法 |
 |---|---|---|---|
@@ -170,3 +178,38 @@ Rename-Item "$p.upstream-0.3.1" "dsh-computer-use"
   深度与节点截断判定，行为差异为 0；但这段重复本身是维护负担，后续改遍历逻辑应提取成共享函数。
 - **真实的冷启动形态未能稳定复现**：多数情况下窗口首查已是完整树，惰性重试处于待命状态。
   它生效时的可见证据是 `Note: the first pass saw only N element(s) … gained M`。
+
+---
+
+# 0.3.2-local.2 ~ .7：修复、回归与测试补强
+
+P6–P13 之后又走了六版，其中三版是**修自己引入的缺陷**。记在这里，是因为它们解释了代码里几处
+看起来"绕"的写法，也标出了这条线踩过的坑。
+
+| # | 提交 / 版本 | 问题 | 修法 |
+|---|---|---|---|
+| P14 | `a0ade00` / `0.3.2-local.3` | `element_index` 点击**完全不可用**：内核普通点击路径回 `note: null`，而 `click` 的 schema 把 `note` 声明为 string 且 `additionalProperties: false`，于是每次按索引点击都被宿主拒绝：`tool "click" returned invalid output: "value.note" must be a string`。marker 路径因为会用吸附判定覆盖 `note` 而侥幸正常 | 删掉合并结果里的 null 键（`lib/tools.js` 先精确删 `note`，再兜底删所有 null）；兜底跳过 `required` 的 `ok`，否则会把「校验失败」变成「缺必填字段」 |
+| P15 | `5697ff0` / `0.3.2-local.4` | `local.2` 的坐标去重**实际无效**：条件要求 `coordinateSpace === captureSpace`，但前者恒为 `window`、后者在 `modelScale==1` 时为 `screenshot`，两者永不相等 | 只比较**坐标数值**：两点相等只说一次，仅在截图降采样、数值确实不同时才同时给出 |
+| P16 | `45f18ad` / `0.3.2-local.5` | 琥珀落点环偏移一个窗口原点（P4 回归）：`withPointerMotion` 把内核回执的 `x/y` 直接当屏幕坐标传给 `recordAction`，而 P4 已把 click 的 `x/y` 改成窗口相对，`recordAction` 又减一次原点。实测窗口原点 `(120,120)`、点击 `(400,600)`，环画在 `(280,480)` | 先经快照 bounds 换算回屏幕坐标。**但这一版换算写在了对所有 action 生效的位置，引入了 P17** |
+| P17 | `966b7be` / `0.3.2-local.6` | P16 的通用换算把 `scroll`/`drag` 反向带偏：它们的回执本就来自 `$toScreen`、是屏幕坐标（P4 只改了 click 的三个 return） | 收窄为 `kind === 'click'` 才换算；其余 action 原样记录。8 个 action 逐个实测，含 `.4`/`.5`/`.6` 三版对照 |
+| P18 | `ba5161b` / `0.3.2-local.7` | P3 的 identity 恢复路径**一次都没被测过**：所有用例都用 `path=''` 且不带 identity；且 fixture 白名单停在 `Invoke-Action`，5 个用例自 P3 起一直红 | 白名单按性质分开——纯函数加载真实实现（`Find-ElementByIdentity`/`Convert-KeyChord`），会产生真实输入的（`Invoke-SecondaryAction`/`Invoke-Scroll`/`Invoke-Drag`）改为桩；新增「路径漂移按 identity 找回」与「identity 也找不到时必须失败且不点击」两条用例 |
+
+## 测试基础设施
+
+- `0.3.2-local.1` 起加 `test/output-schema.test.mjs`：用真实 PowerShell 边界 mock 驱动 `execute()`，
+  调用宿主自己的 `validateJsonSchemaValue` 校验输出。**此前 `test/` 与 `scripts/` 从未校验过
+  `output.schema`**，这正是 P14 能潜伏到线上的原因。
+- `scripts/reverse-check.mjs`：把每项修复在临时副本里逐个回退，断言对应测试会变红。
+  「测试通过」不能说明修复被锁住——这一步才能。
+- `npm test` 现含 9 个测试文件，55 条断言全绿。
+
+## 已知缺陷（未修）
+
+- `click.error` 是**死字段**：`.5` 为它加了 schema 声明，但全链路没有任何代码往 `merged.error` 写值，
+  且 `lib/ps1.js` 在 `ok === false` 时直接 reject，render 的 `Click FAILED` 分支经 `execute()` 不可达。
+  `perform_secondary_action` 的 `error` / `note` 同样拿不到。声明本身是为将来留位，
+  但要知道它现在不会输出。
+- `marker-raw` 回执最坏 598 字符（`element` 路径的 5.2 倍）。5 条 `nearby` 里可能混入长名容器
+  （`elementLabel` 上限 56 字符），把有用控件挤到末尾。可考虑 `nearby` 取 3 条、label 截到 40。
+- `get_app_state` 的 `treeText` 尾部现在混有五种风格的行（`Grid:` / `Amber ring:` 无前缀，
+  `Note:` / `Truncated:` / `Warning:` / `Tree budget:` 带前缀）。语义自解释，但对模型不算干净。

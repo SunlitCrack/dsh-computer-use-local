@@ -145,7 +145,7 @@ index ec1e721..4318696 100644
    annotate: z
      .object({
 diff --git a/lib/tools.js b/lib/tools.js
-index b110d4b..8c98cbc 100644
+index 1812638..bd4a0f1 100644
 --- a/lib/tools.js
 +++ b/lib/tools.js
 @@ -177,7 +177,7 @@ const REOBSERVE_TEXT = 'Next: call get_app_state to verify before any other acti
@@ -168,7 +168,29 @@ index b110d4b..8c98cbc 100644
    const includeScreenshot = config.includeScreenshot !== false;
    const annotate = config.annotate ?? {};
    const annotateGrid = annotate.grid !== false;        // numbered crosshair grid on screenshots
-@@ -329,25 +329,111 @@ export function buildTools(ctx, session, config = {}) {
+@@ -302,6 +302,21 @@ export function buildTools(ctx, session, config = {}) {
+     return index == null ? null : session.elementScreenPoint(index);
+   }
+ 
++  /**
++   * Identity captured with the snapshot for one element. The kernel addresses
++   * elements by a positional path (child ordinals), so a re-rendered window can
++   * make the same path hit a NEIGHBOUR (LOCAL PATCH P3). The kernel now checks
++   * this identity before acting and re-finds the element by AutomationId /
++   * Name when the path drifted.
++   */
++  function elementIdentity(el) {
++    return {
++      name: el?.name ?? '',
++      automationId: el?.automationId ?? '',
++      role: el?.role ?? '',
++    };
++  }
++
+   /** Model coordinates arrive in the ATTACHED image space (DSH may downscale);
+    *  map them back to the capture space before kernel math. */
+   function modelCoordinate(value) {
+@@ -314,25 +329,111 @@ export function buildTools(ctx, session, config = {}) {
      return x == null || y == null ? null : session.toScreenPoint(modelCoordinate(x), modelCoordinate(y));
    }
  
@@ -289,7 +311,7 @@ index b110d4b..8c98cbc 100644
      for (const el of elements) {
        if (!el || el.enabled === false) continue;
        const secondaryActions = Array.isArray(el.secondaryActions) ? el.secondaryActions : [];
-@@ -359,19 +445,64 @@ export function buildTools(ctx, session, config = {}) {
+@@ -344,19 +445,64 @@ export function buildTools(ctx, session, config = {}) {
        if (!interactive) continue;
        const f = el.frame;
        if (!f || cx < f.x || cx > f.x + f.width || cy < f.y || cy > f.y + f.height) continue;
@@ -360,7 +382,35 @@ index b110d4b..8c98cbc 100644
      };
    }
  
-@@ -522,7 +653,17 @@ export function buildTools(ctx, session, config = {}) {
+@@ -439,8 +585,26 @@ export function buildTools(ctx, session, config = {}) {
+       motion?.commit();
+       const result = await pendingResult;
+       const fallback = validTargets.at(-1) ?? null;
+-      const finalPoint = result && Number.isFinite(result.x) && Number.isFinite(result.y)
++      // Kernel receipts mix two coordinate spaces, and getting this wrong puts
++      // the amber "where did it land" ring somewhere else:
++      //   - click: P4 changed these returns to WINDOW-relative pixels
++      //     (uia.ps1 InvokePattern / element / coordinate branches, :1678/:1686/:1694).
++      //   - scroll and drag: their returns still hand back the SCREEN point
++      //     ($pt / $pt2 from $toScreen, :1798/:1809/:1820), because P4 only
++      //     touched click.
++      // perform_secondary_action / set_value / select_text return no x/y at all,
++      // so they fall through to the target point.
++      // recordAction stores SCREEN pixels and subtracts the window origin
++      // itself: convert window-relative values first, and leave screen values
++      // alone. Converting unconditionally moved scroll/drag by one origin.
++      const kernelPoint = result && Number.isFinite(result.x) && Number.isFinite(result.y)
+         ? { x: result.x, y: result.y }
++        : null;
++      const b = session.state?.window?.bounds;
++      const finalPoint = kernelPoint
++        ? (kind === 'click' && b
++          ? { x: kernelPoint.x + b.x, y: kernelPoint.y + b.y }
++          : kernelPoint)
+         : fallback;
+       if (finalPoint) session.recordAction(kind, finalPoint.x, finalPoint.y);
+       return result;
+@@ -507,7 +671,17 @@ export function buildTools(ctx, session, config = {}) {
          'Returns the accessibility tree with numbered element indices — every line carries frame=[x,y,w,h] in screenshot pixels, '
          + 'so a tree hit can be clicked directly by its frame center without reading the screenshot — plus a screenshot of the window. ' +
          'Coordinates in click/scroll/drag are screenshot-relative pixels.',
@@ -379,7 +429,28 @@ index b110d4b..8c98cbc 100644
        output: {
          schema: {
            type: 'object',
-@@ -570,7 +711,26 @@ export function buildTools(ctx, session, config = {}) {
+@@ -534,10 +708,47 @@ export function buildTools(ctx, session, config = {}) {
+                   },
+                 },
+                 foreground: { type: 'boolean', required: true },
++                // P5: how the window was chosen when the caller passed an app
++                // name (process match vs title match, and how many candidates).
++                pick: {
++                  oneOf: [
++                    {
++                      type: 'object',
++                      additionalProperties: false,
++                      properties: {
++                        by: { type: 'string' },
++                        candidates: { type: 'integer' },
++                        ambiguous: { type: 'boolean' },
++                        foreground: { type: 'boolean' },
++                        title: { type: 'string' },
++                      },
++                    },
++                    { type: 'null' },
++                  ],
++                },
                },
              },
              elementCount: { type: 'integer', required: true },
@@ -406,7 +477,7 @@ index b110d4b..8c98cbc 100644
              treeText: { type: 'string', required: true },
              screenshotRef: {
                oneOf: [
-@@ -596,12 +756,16 @@ export function buildTools(ctx, session, config = {}) {
+@@ -563,18 +774,38 @@ export function buildTools(ctx, session, config = {}) {
          const continuationHwnd = session.matchesApp(args.app)
            ? session.state?.window?.hwnd ?? null
            : null;
@@ -425,7 +496,29 @@ index b110d4b..8c98cbc 100644
            includeScreenshot,
            fx: fxPayload(),
            annotate: { grid: annotateGrid, lastPoint: annotateLastPoint, activate: annotateActivate, displayWidth: 1024 },
-@@ -667,11 +831,59 @@ export function buildTools(ctx, session, config = {}) {
+           lastPoint: continuationHwnd ? session.lastScreenPoint ?? null : null,
+         }, { signal: exec?.signal });
+         session.store(result, args.app);
++        // LOCAL PATCH P5: app:"explorer" (or any name shared by several
++        // processes) used to resolve to an arbitrary process's main window --
++        // measured: it returned the desktop shell "Program Manager" instead of
++        // any folder window. The kernel now picks over the same visible-window
++        // list list_apps uses, prefers the foreground window, and reports how
++        // many candidates there were; surface that instead of hiding it.
++        const pick = result.window?.pick;
++        if (pick && pick.by === 'process' && pick.candidates > 1) {
++          result.treeText += `\nWindow pick: ${pick.candidates} windows of process `
++            + `${JSON.stringify(result.window.processName)} matched — used `
++            + `"${pick.title}"${pick.foreground ? ' (foreground)' : ' (largest area, NOT foreground)'}. `
++            + 'Pass hwnd:<n> or pid:<n> to pin one window.';
++        } else if (pick && pick.by === 'title') {
++          result.treeText += `\nWindow pick: no window of a process named ${JSON.stringify(args.app)}; `
++            + `matched the window title instead ("${pick.title}").`;
++        }
+         // Kernel markers are capture pixels — stored as-is, never rescaled by
+         // modelScale (click({marker}) maps them straight through toScreenPoint).
+         session.markers = Array.isArray(result.markers) ? result.markers : [];
+@@ -618,11 +849,59 @@ export function buildTools(ctx, session, config = {}) {
          if (result.lastPointDrawn === true) {
            result.treeText += LAST_POINT_LEGEND;
          }
@@ -485,7 +578,7 @@ index b110d4b..8c98cbc 100644
            treeText: result.treeText,
            screenshotRef,
          };
-@@ -711,19 +923,85 @@ export function buildTools(ctx, session, config = {}) {
+@@ -662,14 +941,109 @@ export function buildTools(ctx, session, config = {}) {
            additionalProperties: false,
            properties: {
              ok: { type: 'boolean', required: true },
@@ -497,6 +590,7 @@ index b110d4b..8c98cbc 100644
              note: { type: 'string' },
 -            x: { type: 'integer' },
 -            y: { type: 'integer' },
++            error: { type: 'string', description: 'Why the kernel refused the click, when ok is false.' },
 +            x: { type: 'integer', description: 'Window-relative pixel x of the delivered click (P4: this used to be screen pixels).' },
 +            y: { type: 'integer', description: 'Window-relative pixel y of the delivered click.' },
 +            captureX: { type: 'integer', description: 'Window-relative pixel x the click targeted.' },
@@ -533,29 +627,47 @@ index b110d4b..8c98cbc 100644
              ...OBSERVATION_REQUIRED_PROPERTY,
            },
          },
--        render: (_args, value) => summary([
--          `Clicked (${value.via ?? 'coordinate'})`,
--          value.x != null ? `at (${value.x}, ${value.y}) window px` : '',
--          value.note ?? '',
--          REOBSERVE_TEXT,
--        ]),
+-        render: (_args, value) => summary([`Clicked (${value.via ?? 'coordinate'})`, value.x != null ? `at (${value.x}, ${value.y})` : '', REOBSERVE_TEXT]),
 +        // The model only ever sees these blocks; `value` is for programmatic
 +        // callers. Coordinates therefore have to be named in the text, an
 +        // unsnapped marker has to say so, and a snap has to report how far it
 +        // moved the click — otherwise a guessed pixel, a real hit and a silent
 +        // 287px slide all look identical in the transcript.
 +        render: (_args, value) => {
++          // x/y and captureX/Y are usually the same window-relative point: with
++          // modelScale 1 the screenshot is a 1:1 copy of the window, so both
++          // pairs carry identical numbers. Print the point once when the
++          // NUMBERS agree, and show both only when the screenshot was
++          // downscaled and the pairs actually differ.
++          //
++          // Do NOT gate this on the space names: coordinateSpace is 'window'
++          // while captureSpace is 'screenshot' whenever modelScale is 1, so a
++          // name comparison never matches and the receipt repeats itself
++          // ("at window (87, 103) = screenshot (87, 103)") — which is exactly
++          // the bug this was meant to fix.
++          const screenSpace = value.coordinateSpace ?? 'window';
++          const captureSpace = value.captureSpace === 'screenshot' ? 'screenshot' : 'window';
++          const sameNumbers = value.x != null && value.captureX != null
++            && value.x === value.captureX && value.y === value.captureY;
 +          const where = [];
-+          if (value.x != null) where.push(`${value.coordinateSpace ?? 'window'} (${value.x}, ${value.y})`);
-+          if (value.captureX != null) {
-+            // Name the space honestly: capture pixels and the attached screenshot
-+            // differ by modelScale (e.g. 2584 vs 2561 px, ~1%).
-+            const space = value.captureSpace === 'screenshot' ? 'screenshot' : 'window';
-+            where.push(`${space} (${value.captureX}, ${value.captureY})`);
++          if (value.x != null) where.push(`${screenSpace} (${value.x}, ${value.y})`);
++          if (value.captureX != null && !sameNumbers) {
++            where.push(`${captureSpace} (${value.captureX}, ${value.captureY})`);
 +          }
-+          const parts = [`Clicked (${value.via ?? 'coordinate'})`];
++          // A failed click must not read like a successful one. The kernel
++          // returns ok:false with an error for a refused action, and the receipt
++          // used to start with "Clicked (...)" regardless — the model saw
++          // success and moved on.
++          const failed = value.ok === false;
++          const parts = [failed
++            ? `Click FAILED (${value.via ?? 'coordinate'})`
++            : `Clicked (${value.via ?? 'coordinate'})`];
 +          if (value.hitLabel) parts.push(`on ${value.hitLabel}`);
 +          if (where.length > 0) parts.push(`at ${where.join(' = ')}`);
++          if (failed) {
++            parts.push(`— ${value.error ? String(value.error) : 'the kernel refused the action'};`
++              + ' nothing was clicked, so do not assume the UI changed.');
++          }
 +          if (value.via === 'marker-snapped' && value.snapShift != null && value.snapShift > 0) {
 +            parts.push(`(snap moved the click ${value.snapShift}px from the marker;`
 +              + ' if that is not the intended control, click a marker centred on it or use element_index)');
@@ -580,7 +692,11 @@ index b110d4b..8c98cbc 100644
        },
        async execute(args, exec) {
          requireFreshSnapshot(args.app, 'click');
-@@ -735,6 +1013,9 @@ export function buildTools(ctx, session, config = {}) {
+@@ -677,9 +1051,13 @@ export function buildTools(ctx, session, config = {}) {
+         if (args.marker != null) targetDesc = `marker ${args.marker}`;
+         else if (args.element_index != null) targetDesc = `element ${args.element_index}`;
+         let path = null;
++        let identity = null;
          let target = null;
          let kernelPoint = null;   // capture-pixel point for the kernel click x/y
          let snapNote = null;
@@ -590,7 +706,7 @@ index b110d4b..8c98cbc 100644
          if (args.marker != null) {
            if (!Array.isArray(session.markers) || session.markers.length === 0) {
              throw new Error('click: no grid markers in session — call get_app_state first');
-@@ -746,20 +1027,54 @@ export function buildTools(ctx, session, config = {}) {
+@@ -691,19 +1069,54 @@ export function buildTools(ctx, session, config = {}) {
                'call get_app_state first',
              );
            }
@@ -629,7 +745,7 @@ index b110d4b..8c98cbc 100644
          } else if (args.element_index != null) {
            const element = session.requireElement(args.element_index, 'click');
            path = element.path;
-           identity = elementIdentity(element);
++          identity = elementIdentity(element);
            target = elementPoint(args.element_index);
 +          verdict.via = 'element';
 +          verdict.hitLabel = elementLabel(element);
@@ -645,7 +761,14 @@ index b110d4b..8c98cbc 100644
          } else {
            throw new Error('click requires either marker, element_index, or both x and y');
          }
-@@ -775,7 +1090,37 @@ export function buildTools(ctx, session, config = {}) {
+@@ -712,13 +1125,58 @@ export function buildTools(ctx, session, config = {}) {
+             action: 'click',
+             app: args.app,
+             path,
++            element_identity: identity,
+             snapshot_hwnd: session.state?.window?.hwnd ?? null,
+             click_count: args.click_count ?? 1,
+             mouse_button: args.mouse_button ?? 'left',
              x: kernelPoint ? kernelPoint.x : modelCoordinate(args.x),
              y: kernelPoint ? kernelPoint.y : modelCoordinate(args.y),
              hide_cursor: !motion,
@@ -655,6 +778,11 @@ index b110d4b..8c98cbc 100644
 +            // in capture space beside it so one line answers "where did this land".
 +            const merged = { ...result };
 +            if (snapNote) merged.note = snapNote;
++            // The kernel emits note:null on the plain path (uia.ps1 sets
++            // `$note = $null` before the drift check). The schema declares note
++            // as a string, so a null here fails output validation with
++            // `"value.note" must be a string` — drop it instead.
++            if (merged.note == null) delete merged.note;
 +            // Kernel via names the delivery mechanism; the addressing mode is
 +            // what the model needs (it distinguishes a snap from a guess).
 +            if (verdict.via) merged.via = verdict.via;
@@ -679,29 +807,281 @@ index b110d4b..8c98cbc 100644
 +              if (verdict[key] !== undefined) merged[key] = verdict[key];
 +            }
 +            if (Array.isArray(verdict.nearby) && verdict.nearby.length > 0) merged.nearby = verdict.nearby;
++            // Belt and braces: the output schema is additionalProperties:false
++            // and types every field, so a null anywhere in the kernel's reply
++            // fails validation for the whole click. Drop nulls rather than
++            // ship a result the host will reject -- but never a required field:
++            // deleting `ok` turns "validation failed" into "missing required
++            // property", which is harder to diagnose.
++            for (const key of Object.keys(merged)) {
++              if (merged[key] === null && key !== 'ok') delete merged[key];
++            }
 +            return merged;
 +          }), { pulse: true, signal: exec?.signal }));
        },
        presentCall: () => pendingCall('click'),
      },
+@@ -741,6 +1199,7 @@ export function buildTools(ctx, session, config = {}) {
+             ok: { type: 'boolean', required: true },
+             via: { type: 'string' },
+             error: { type: 'string' },
++            note: { type: 'string' },
+             ...OBSERVATION_REQUIRED_PROPERTY,
+           },
+         },
+@@ -748,12 +1207,15 @@ export function buildTools(ctx, session, config = {}) {
+       },
+       async execute(args, exec) {
+         requireFreshSnapshot(args.app, 'perform_secondary_action');
+-        const path = session.requireElement(args.element_index, 'perform_secondary_action').path;
++        const element = session.requireElement(args.element_index, 'perform_secondary_action');
++        const path = element.path;
++        const identity = elementIdentity(element);
+         await requireApproval(ctx, exec, 'perform_secondary_action', `Perform ${args.action} on element ${args.element_index} in ${args.app}`);
+         return runMutation(() => withPointerMotion('perform_secondary_action', [elementPoint(args.element_index)], () => invokePowerShell({
+           action: 'perform_secondary_action',
+           app: args.app,
+           path,
++          element_identity: identity,
+           snapshot_hwnd: session.state?.window?.hwnd ?? null,
+           secondary_action: args.action,
+         }, { signal: exec?.signal }), { pulse: false, signal: exec?.signal }));
+@@ -784,10 +1246,12 @@ export function buildTools(ctx, session, config = {}) {
+       },
+       async execute(args, exec) {
+         requireFreshSnapshot(args.app, 'set_value');
+-        const path = session.requireElement(args.element_index, 'set_value').path;
++        const setValueElement = session.requireElement(args.element_index, 'set_value');
++        const path = setValueElement.path;
++        const identity = elementIdentity(setValueElement);
+         await requireApproval(ctx, exec, 'set_value', `Set value of element ${args.element_index} in ${args.app}`);
+         return runMutation(() => withPointerMotion('set_value', [elementPoint(args.element_index)], () => invokePowerShell({
+-          action: 'set_value', app: args.app, path, value: args.value, snapshot_hwnd: session.state?.window?.hwnd ?? null,
++          action: 'set_value', app: args.app, path, element_identity: identity, value: args.value, snapshot_hwnd: session.state?.window?.hwnd ?? null,
+         }, { signal: exec?.signal }), { pulse: false, signal: exec?.signal }));
+       },
+     },
+@@ -825,12 +1289,15 @@ export function buildTools(ctx, session, config = {}) {
+       },
+       async execute(args, exec) {
+         requireFreshSnapshot(args.app, 'select_text');
+-        const path = session.requireElement(args.element_index, 'select_text').path;
++        const selectElement = session.requireElement(args.element_index, 'select_text');
++        const path = selectElement.path;
++        const identity = elementIdentity(selectElement);
+         await requireApproval(ctx, exec, 'select_text', `Select "${args.text}" in element ${args.element_index} of ${args.app}`);
+         return runMutation(() => withPointerMotion('select_text', [elementPoint(args.element_index)], () => invokePowerShell({
+             action: 'select_text',
+             app: args.app,
+             path,
++            element_identity: identity,
+             snapshot_hwnd: session.state?.window?.hwnd ?? null,
+             text: args.text,
+             prefix: args.prefix,
+@@ -877,8 +1344,11 @@ export function buildTools(ctx, session, config = {}) {
+       async execute(args, exec) {
+         requireFreshSnapshot(args.app, 'scroll');
+         let path = null;
++        let identity = null;
+         if (args.element_index != null) {
+-          path = session.requireElement(args.element_index, 'scroll').path;
++          const scrollElement = session.requireElement(args.element_index, 'scroll');
++          path = scrollElement.path;
++          identity = elementIdentity(scrollElement);
+         }
+         const target = elementPoint(args.element_index)
+           ?? coordinatePoint(args.x, args.y)
+@@ -888,6 +1358,7 @@ export function buildTools(ctx, session, config = {}) {
+             action: 'scroll',
+             app: args.app,
+             path,
++            element_identity: identity,
+             snapshot_hwnd: session.state?.window?.hwnd ?? null,
+             direction: args.direction,
+             pages: args.pages ?? 1,
 diff --git a/lib/uia.ps1 b/lib/uia.ps1
-index bd35f2e..98c738d 100644
+index a00b9e5..98c738d 100644
 --- a/lib/uia.ps1
 +++ b/lib/uia.ps1
-@@ -428,12 +428,24 @@ function Find-ElementByIdentity($root, $expected, $maxNodes) {
+@@ -5,6 +5,11 @@
+ $ErrorActionPreference = 'Stop'
+ [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+ $OutputEncoding = [System.Text.Encoding]::UTF8
++# LOCAL PATCH P1: stdin was decoded with the console codepage (cp936 on this
++# machine), so the UTF-8 JSON written by the Node side arrived mojibaked and
++# every non-ASCII type_text / set_value payload was corrupted
++# ("验收" -> "楠屾敹"). Only the output side was pinned to UTF-8 upstream.
++try { [Console]::InputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+ 
+ Add-Type -AssemblyName UIAutomationClient
+ Add-Type -AssemblyName UIAutomationTypes
+@@ -45,7 +50,12 @@ public static class CuNative {
+   [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lParam);
+-  [DllImport("user32.dll")] public static extern int GetWindowTextW(IntPtr hWnd, StringBuilder text, int count);
++  // LOCAL PATCH P2: CharSet.Unicode - without it this StringBuilder is
++  // marshalled as ANSI, so GetWindowTextW's UTF-16 output is read back as
++  // single bytes: non-ASCII titles arrived mojibaked and half length
++  // ("评估 Computer-use ..." -> "膵0O "). GetWindowTextLengthW reports
++  // characters, so the ANSI buffer was also too short for the real text.
++  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr hWnd, StringBuilder text, int count);
+   [DllImport("user32.dll")] public static extern int GetWindowTextLengthW(IntPtr hWnd);
+   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
+@@ -254,6 +264,8 @@ function Get-ProcessInfo($hwnd) {
  }
  
- function Get-SecondaryActions($element) {
+ function Resolve-Window($target) {
++  # P5: selection metadata for the caller (get_state surfaces it in the tree header).
++  $script:LastWindowPick = $null
+   if ($null -ne $target.hwnd -and $target.hwnd -ne 0) {
+     $hwnd = [IntPtr]$target.hwnd
+     if ([CuNative]::IsWindowVisible($hwnd)) { return $hwnd }
+@@ -291,19 +303,58 @@ function Resolve-Window($target) {
+     $candidate = [IntPtr]([int64]$app)
+     if ([CuNative]::IsWindowVisible($candidate)) { return $candidate }
+   }
+-  $procs = Get-Process -ErrorAction SilentlyContinue | Where-Object {
+-    $_.MainWindowHandle -ne [IntPtr]::Zero -and (
+-      $_.ProcessName -eq $app -or $_.ProcessName -eq ($app -replace '\.exe$','')
+-    )
+-  }
+-  if ($procs) { return $procs[0].MainWindowHandle }
+-  # Window-title match. Get-Process is tried first: EnumWindows can be blocked
+-  # in sandboxes/jobs, while MainWindowTitle comes from the process table.
+-  $byTitle = Get-Process -ErrorAction SilentlyContinue | Where-Object {
+-    $_.MainWindowHandle -ne [IntPtr]::Zero -and
+-    $_.MainWindowTitle.IndexOf($app, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+-  } | Sort-Object { $_.MainWindowTitle.Length }
+-  if ($byTitle) { return $byTitle[0].MainWindowHandle }
++  # LOCAL PATCH P5 (window selection consistent with list_apps).
++  # Upstream resolved a process name through Get-Process + MainWindowHandle and
++  # took $procs[0] -- an ARBITRARY process of that name. With two Explorer
++  # processes, app:'explorer' returned the desktop shell (hwnd 65748, the
++  # "Program Manager" window) instead of any folder window, and a just-launched
++  # app whose MainWindowHandle was not populated yet looked "not found" even
++  # though list_apps had just listed it. Selection now runs over the same
++  # visible-window enumeration list_apps uses, skips the shell desktop windows,
++  # prefers the foreground window, and otherwise takes the largest area.
++  $windows = @([CuNative]::ListVisibleWindows())
++  $needleProcess = $app -replace '\.exe$',''
++  $shellSkipped = 0
++  $candidates = @()
++  foreach ($w in $windows) {
++    if ([string]::IsNullOrWhiteSpace($w.Title) -or $w.Title -eq 'Program Manager') { $shellSkipped++; continue }
++    $pn = ''
++    try { $pn = (Get-Process -Id ([int]$w.Pid) -ErrorAction Stop).ProcessName } catch { continue }
++    if ($pn -eq $needleProcess) { $candidates += [pscustomobject]@{ Hwnd = [IntPtr]$w.Hwnd; Title = [string]$w.Title } }
++  }
++  $pickBy = 'process'
++  if ($candidates.Count -eq 0) {
++    $pickBy = 'title'
++    foreach ($w in $windows) {
++      if ([string]::IsNullOrWhiteSpace($w.Title) -or $w.Title -eq 'Program Manager') { continue }
++      if ($w.Title.IndexOf($app, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
++        $candidates += [pscustomobject]@{ Hwnd = [IntPtr]$w.Hwnd; Title = [string]$w.Title }
++      }
++    }
++  }
++  if ($candidates.Count -gt 0) {
++    $chosen = $null
++    foreach ($c in $candidates) {
++      if ([IntPtr]$c.Hwnd -eq $fg) { $chosen = $c; break }
++    }
++    if ($null -eq $chosen) {
++      $bestArea = -1
++      foreach ($c in $candidates) {
++        $r = Get-WindowRectArr $c.Hwnd
++        $area = if ($r) { [int64]$r.width * [int64]$r.height } else { 0 }
++        if ($area -gt $bestArea) { $bestArea = $area; $chosen = $c }
++      }
++    }
++    $script:LastWindowPick = @{
++      by = $pickBy
++      candidates = $candidates.Count
++      ambiguous = ($candidates.Count -gt 1)
++      foreground = ($chosen -and ([IntPtr]$chosen.Hwnd -eq $fg))
++      title = if ($chosen) { [string]$chosen.Title } else { '' }
++    }
++    return [IntPtr]$chosen.Hwnd
++  }
++  $script:LastWindowPick = @{ by = 'none'; candidates = 0; ambiguous = $false; foreground = $false; title = '' }
+   $found = [CuNative]::FindByTitle($app)
+   if ($found -ne [IntPtr]::Zero) { return $found }
+   return $null
+@@ -319,13 +370,82 @@ function Resolve-ElementByPath($root, $path) {
+   return $current
+ }
+ 
+-function Get-SecondaryActions($element) {
+-  $names = @()
++# LOCAL PATCH P3 (identity check for element paths).
++# A path is a list of CHILD ORDINALS, so it is only valid while the tree keeps
++# the same shape. Explorer/Chromium re-render and re-order siblings between the
++# snapshot and the action, and the path then resolves to a NEIGHBOUR: the call
++# reports success while a different element was clicked (measured: element 46
++# opened the file that the tree printed as 48). Every element reference now
++# carries the identity captured at snapshot time; if the path no longer resolves
++# to it, the element is re-found by AutomationId (strongest) or Name+role, and
++# the receipt reports which route was taken.
++function Get-ElementIdentity($element) {
++  $name = ''
++  $automationId = ''
++  $role = ''
++  try { $name = [string]$element.Current.Name } catch {}
++  try { $automationId = [string]$element.Current.AutomationId } catch {}
+   try {
+-    $names = @($element.GetSupportedPatterns() | ForEach-Object {
+-      $_.ProgrammaticName -replace 'PatternIdentifiers\.|Pattern$',''
+-    } | Where-Object { $_ -in @('Invoke','Toggle','ExpandCollapse','SelectionItem','ScrollItem','Value','Text','RangeValue') })
++    $ct = $element.Current.ControlType
++    if ($ct) { $role = $ct.ProgrammaticName -replace 'ControlType\.','' }
+   } catch {}
++  return @{ name = $name; automationId = $automationId; role = $role }
++}
++
++function Test-ElementIdentity($element, $expected) {
++  if ($null -eq $expected) { return $true }
++  $id = Get-ElementIdentity $element
++  $wantAid = [string]$expected.automationId
++  if (-not [string]::IsNullOrEmpty($wantAid)) {
++    return ($id.automationId -eq $wantAid)
++  }
++  $wantName = [string]$expected.name
++  $wantRole = [string]$expected.role
++  if ($id.name -ne $wantName) { return $false }
++  if (-not [string]::IsNullOrEmpty($wantRole) -and $id.role -ne $wantRole) { return $false }
++  return $true
++}
++
++function Find-ElementByIdentity($root, $expected, $maxNodes) {
++  if ($null -eq $expected) { return $null }
++  $wantAid = [string]$expected.automationId
++  $wantName = [string]$expected.name
++  if ([string]::IsNullOrEmpty($wantAid) -and [string]::IsNullOrEmpty($wantName)) { return $null }
++  $budget = if ($maxNodes -and $maxNodes -gt 0) { $maxNodes } else { 1200 }
++  $visited = 0
++  $queue = New-Object System.Collections.Queue
++  $queue.Enqueue($root)
++  while ($queue.Count -gt 0 -and $visited -lt $budget) {
++    $node = $queue.Dequeue()
++    $visited++
++    if (Test-ElementIdentity $node $expected) { return $node }
++    try {
++      $children = $node.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)
++      foreach ($child in $children) { $queue.Enqueue($child) }
++    } catch {}
++  }
++  return $null
++}
++
++function Get-SecondaryActions($element) {
 +  # Probe the same eight patterns the tree walk cares about instead of
 +  # GetSupportedPatterns(), which is a cross-process query materializing every
 +  # pattern the provider offers (~3x slower per element). Keep this list in step
 +  # with the one in Invoke-GetState.
-   $names = @()
--  try {
--    $names = @($element.GetSupportedPatterns() | ForEach-Object {
--      $_.ProgrammaticName -replace 'PatternIdentifiers\.|Pattern$',''
--    } | Where-Object { $_ -in @('Invoke','Toggle','ExpandCollapse','SelectionItem','ScrollItem','Value','Text','RangeValue') })
--  } catch {}
++  $names = @()
 +  foreach ($sp in @(
 +    @{ p = [System.Windows.Automation.InvokePattern]::Pattern; n = 'Invoke' },
 +    @{ p = [System.Windows.Automation.TogglePattern]::Pattern; n = 'Toggle' },
@@ -718,7 +1098,7 @@ index bd35f2e..98c738d 100644
    return $names
  }
  
-@@ -931,24 +943,32 @@ function Get-GridMarkers($elements, $windowRect) {
+@@ -823,24 +943,32 @@ function Get-GridMarkers($elements, $windowRect) {
    }
  
    # Every candidate element must carry at least one marker, or clicking it by
@@ -755,7 +1135,7 @@ index bd35f2e..98c738d 100644
    }
    return $markers
  }
-@@ -1064,8 +1084,11 @@ function Get-AutomationRoot([IntPtr]$hwnd) {
+@@ -956,8 +1084,11 @@ function Get-AutomationRoot([IntPtr]$hwnd) {
  
  function Invoke-GetState($params) {
    $timer = [System.Diagnostics.Stopwatch]::StartNew()
@@ -769,7 +1149,7 @@ index bd35f2e..98c738d 100644
    $includeScreenshot = if ($null -eq $params.includeScreenshot) { $true } else { [bool]$params.includeScreenshot }
  
    $hwnd = Resolve-Window $params
-@@ -1118,7 +1141,27 @@ function Invoke-GetState($params) {
+@@ -1010,7 +1141,27 @@ function Invoke-GetState($params) {
        $ct = $el.Current.ControlType
        if ($ct) { $controlType = $ct.ProgrammaticName -replace 'ControlType\.','' }
      } catch {}
@@ -798,7 +1178,7 @@ index bd35f2e..98c738d 100644
      try {
        if ($patterns -contains 'Value') {
          $valuePattern = $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
-@@ -1157,8 +1200,17 @@ function Invoke-GetState($params) {
+@@ -1049,8 +1200,17 @@ function Invoke-GetState($params) {
  
      # maxDepth is the deepest level that may be captured: the window root is
      # depth 0, so a node expands only while its children stay within the budget.
@@ -817,7 +1197,7 @@ index bd35f2e..98c738d 100644
      } else {
        try {
          $children = $el.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)
-@@ -1173,6 +1225,163 @@ function Invoke-GetState($params) {
+@@ -1065,6 +1225,163 @@ function Invoke-GetState($params) {
    }
    if ($queue.Count -gt 0) { $nodeTruncated = $true }
  
@@ -981,7 +1361,7 @@ index bd35f2e..98c738d 100644
    $screenshot = ''
    $markers = @()
    $lastPointDrawn = $false
-@@ -1199,6 +1408,73 @@ function Invoke-GetState($params) {
+@@ -1091,6 +1408,73 @@ function Invoke-GetState($params) {
      } catch { $screenshot = ''; $markers = @(); $lastPointDrawn = $false }
    }
  
@@ -1055,7 +1435,16 @@ index bd35f2e..98c738d 100644
    # tree text like Codex <app_state>
    $winTitle = try { $root.Current.Name } catch { '' }
    $lines = @()
-@@ -1233,6 +1509,14 @@ function Invoke-GetState($params) {
+@@ -1117,7 +1501,7 @@ function Invoke-GetState($params) {
+ 
+   return @{
+     ok = $true
+-    window = @{ hwnd = $hwnd.ToInt64(); pid = $windowInfo.pid; processName = $windowInfo.processName; title = $winTitle; bounds = $rect; foreground = $isForeground }
++    window = @{ hwnd = $hwnd.ToInt64(); pid = $windowInfo.pid; processName = $windowInfo.processName; title = $winTitle; bounds = $rect; foreground = $isForeground; pick = $script:LastWindowPick }
+     elements = $elements
+     elementCount = $elements.Count
+     nodeCount = $visitedCount
+@@ -1125,6 +1509,14 @@ function Invoke-GetState($params) {
      truncatedByNodes = $nodeTruncated
      truncatedByDepth = $depthTruncated
      maxDepth = $maxDepth
@@ -1070,6 +1459,103 @@ index bd35f2e..98c738d 100644
      durationMs = [int]$timer.ElapsedMilliseconds
      screenshot = $screenshot
      screenshotWidth = $rect.width
+@@ -1194,6 +1586,16 @@ function Invoke-Action($params) {
+     if (-not (Activate-Window $hwnd)) {
+       Fail "cannot bring window $($hwnd.ToInt64()) to the foreground; action was not sent"
+     }
++    # P3b: activation can recreate a provider's elements (Explorer rebuilds its
++    # shell view on foreground change). The root captured above then points at a
++    # dead tree: every path segment resolves to a nameless stale node and the
++    # identity search finds nothing, so a recoverable drift looked fatal.
++    # Re-acquire now that the window really is foreground; keep the previous
++    # root if the provider refuses mid-activation (the Chrome case above).
++    try {
++      $reactivated = Get-AutomationRoot $hwnd
++      if ($null -ne $reactivated) { $root = $reactivated }
++    } catch { }
+   }
+ 
+   # screen->screenshot coordinate: params.x/y are screenshot pixels
+@@ -1203,6 +1605,7 @@ function Invoke-Action($params) {
+   }
+ 
+   $element = $null
++  $elementResolution = $null
+   # An explicit path (even the empty one) means "address by element". The empty
+   # path is the window root, i.e. element_index 0 -- it used to be dropped by the
+   # IsNullOrWhiteSpace guard and silently degraded to a click at window (0,0).
+@@ -1215,7 +1618,26 @@ function Invoke-Action($params) {
+       $segments = @($pathValue -split '\.' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
+     }
+     $element = Resolve-ElementByPath $root $segments
+-    if ($null -eq $element) { Fail "element path '$pathValue' no longer resolves; call get_app_state again" }
++    # P3: the path is positional; keep the identity the snapshot recorded.
++    $expected = $params.element_identity
++    $maxNodesForSearch = if ($null -ne $params.max_nodes) { [int]$params.max_nodes } else { 1200 }
++    if ($null -eq $element) {
++      if ($null -ne $expected) { $element = Find-ElementByIdentity $root $expected $maxNodesForSearch }
++      if ($null -eq $element) { Fail "element path '$pathValue' no longer resolves; call get_app_state again" }
++      $elementResolution = 'identity-recovered'
++    } elseif (-not (Test-ElementIdentity $element $expected)) {
++      $drifted = Get-ElementIdentity $element
++      $recovered = Find-ElementByIdentity $root $expected $maxNodesForSearch
++      if ($null -eq $recovered) {
++        Fail ("element path '$pathValue' now resolves to a different element " +
++          "(name='$($drifted.name)' id='$($drifted.automationId)') and the snapshot's element is no longer in the tree; " +
++          'call get_app_state again')
++      }
++      $element = $recovered
++      $elementResolution = 'identity-recovered-from-drift'
++    } else {
++      $elementResolution = 'path'
++    }
+   }
+ 
+   $script:BorrowCursor = if ($null -eq $params.borrowCursor) { $true } else { [bool]$params.borrowCursor }
+@@ -1244,11 +1666,24 @@ function Invoke-Action($params) {
+         }
+         if ($invoke) {
+           $ptS = & $toScreen $elCenter.x $elCenter.y
+-          return @{ ok = $true; via = 'InvokePattern'; note = 'clicked element via AX Invoke pattern'; x = $ptS.x; y = $ptS.y }
++          # P4: x/y are reported in the SAME space every other coordinate in this
++          # tool surface uses (window-relative screenshot pixels: tree frames,
++          # markers, click x/y inputs) so the receipt agrees with the amber ring.
++          # Upstream returned SCREEN pixels here, which in a 1301x782 window read
++          # as a point outside the window (measured: "(1259, 860)").
++          $note = 'clicked element via AX Invoke pattern; the pointer did not move'
++          if ($elementResolution -and $elementResolution -ne 'path') {
++            $note += "; element re-found by identity after the snapshot's path drifted ($elementResolution)"
++          }
++          return @{ ok = $true; via = 'InvokePattern'; note = $note; x = [int]$elCenter.x; y = [int]$elCenter.y }
+         }
+         $pt = & $toScreen $elCenter.x $elCenter.y
+         Invoke-ClickAt $pt.x $pt.y $button $count
+-        return @{ ok = $true; via = 'coordinate'; x = $pt.x; y = $pt.y }
++        $note = $null
++        if ($elementResolution -and $elementResolution -ne 'path') {
++          $note = "element re-found by identity after the snapshot's path drifted ($elementResolution)"
++        }
++        return @{ ok = $true; via = 'coordinate'; note = $note; x = [int]$elCenter.x; y = [int]$elCenter.y }
+       }
+       $x = [double]$params.x; $y = [double]$params.y
+       if ($x -lt 0 -or $y -lt 0 -or $x -ge $rect.width -or $y -ge $rect.height) {
+@@ -1256,12 +1691,15 @@ function Invoke-Action($params) {
+       }
+       $pt = & $toScreen $x $y
+       Invoke-ClickAt $pt.x $pt.y $button $count
+-      return @{ ok = $true; via = 'coordinate'; x = $pt.x; y = $pt.y }
++      return @{ ok = $true; via = 'coordinate'; x = [int]$x; y = [int]$y }
+     }
+ 
+     'perform_secondary_action' {
+       if (-not $element) { Fail 'perform_secondary_action requires element_index' }
+       $result = Invoke-SecondaryAction $element ([string]$params.secondary_action)
++      if ($result -is [hashtable] -and $elementResolution -and $elementResolution -ne 'path') {
++        $result.note = (("element re-found by identity after the snapshot's path drifted ($elementResolution); " + [string]$result.note).TrimEnd('; '))
++      }
+       return $result
+     }
+ 
 diff --git a/mcp-server.mjs b/mcp-server.mjs
 index 1c0bafe..85c7218 100644
 --- a/mcp-server.mjs
@@ -1087,3 +1573,47 @@ index 1c0bafe..85c7218 100644
    fx: { overlay: true, screenshot: false },
  });
  setAuditEnabled(config.audit !== false);
+diff --git a/package.json b/package.json
+index 7bcb342..d4c55e0 100644
+--- a/package.json
++++ b/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "@milkuovo/dsh-computer-use",
+-  "version": "0.3.1",
++  "version": "0.3.2-local.7",
+   "description": "Codex Computer Use for DeepSeek Harness on Windows: screenshot + UI Automation tree + mouse/keyboard actions, aligned with the official 10-method Codex Computer Use tool surface. Registers as the exclusive provider on the official DSH 0.1.7+ computer-use seam when present. Includes a zero-dependency stdio MCP server.",
+   "type": "module",
+   "main": "lib/index.js",
+@@ -15,7 +15,7 @@
+     "dsh-computer-use-mcp": "./mcp-server.mjs"
+   },
+   "scripts": {
+-    "test": "node scripts/logic-test.mjs && node --test test/session.test.mjs test/approval-audit.test.mjs test/duplicate-guard.test.mjs test/seam.test.mjs test/cancellation.test.mjs test/kernel-safety.test.mjs test/mcp-stdio.test.mjs test/update.test.mjs",
++    "test": "node scripts/logic-test.mjs && node --test test/session.test.mjs test/approval-audit.test.mjs test/duplicate-guard.test.mjs test/seam.test.mjs test/cancellation.test.mjs test/kernel-safety.test.mjs test/mcp-stdio.test.mjs test/update.test.mjs test/output-schema.test.mjs",
+     "test:integration": "node --test test/annotate.test.mjs test/cursor-return.test.mjs test/overlay-session.test.mjs test/tree-frames.test.mjs",
+     "test:e2e": "node scripts/tool-surface-e2e.mjs"
+   },
+@@ -48,16 +48,19 @@
+     "@deepseek-ai/schemastery": "^3.18.2",
+     "@deepseek-ai/dsh-tools": ">=0.1.2-rc.1 <0.3.0-0"
+   },
++  "devDependencies": {
++    "@deepseek-ai/dsh-tools": ">=0.1.2-rc.1 <0.3.0-0"
++  },
+   "engines": {
+     "node": ">=18"
+   },
+   "repository": {
+     "type": "git",
+-    "url": "git+https://github.com/mekos2772/dsh-computer-use.git"
++    "url": "git+https://github.com/SunlitCrack/dsh-computer-use-local.git"
+   },
+-  "homepage": "https://github.com/mekos2772/dsh-computer-use#readme",
++  "homepage": "https://github.com/SunlitCrack/dsh-computer-use-local#readme",
+   "bugs": {
+-    "url": "https://github.com/mekos2772/dsh-computer-use/issues"
++    "url": "https://github.com/SunlitCrack/dsh-computer-use-local/issues"
+   },
+   "author": "mekos2772",
+   "license": "MIT"

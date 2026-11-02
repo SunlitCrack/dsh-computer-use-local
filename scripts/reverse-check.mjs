@@ -38,12 +38,23 @@ const cases = [
     to: 'if (merged[key] === null) delete merged[key];',
   },
   { name: 'FAILED receipt branch', from: /const failed = value\.ok === false;/, to: 'const failed = false;' },
+  {
+    // P3 identity recovery is exercised by test/kernel-safety.test.mjs, whose
+    // cases come from a PowerShell fixture that whitelists kernel functions.
+    // Dropping Find-ElementByIdentity reproduces the state before 0.3.2-local.7,
+    // when the recovery path could not be reached at all.
+    name: 'P3 identity recovery (kernel-safety)',
+    test: 'test/kernel-safety.test.mjs',
+    file: 'test/fixtures/kernel-safety.ps1',
+    from: /,\r?\n\s*# Recovering a drifted path by identity needs this lookup[\s\S]*?'Find-ElementByIdentity',/,
+    to: ',',
+  },
 ];
 
 /** Run the suite in `dir` and return the names of failing tests. */
-function failingTests(dir) {
+function failingTests(dir, testFile) {
   try {
-    execFileSync(process.execPath, ['--test', 'test/output-schema.test.mjs'], {
+    execFileSync(process.execPath, ['--test', testFile], {
       cwd: dir, stdio: 'pipe', timeout: 180000, encoding: 'utf8',
     });
     return [];
@@ -62,8 +73,13 @@ function failingTests(dir) {
 const dirs = [];
 let failures = 0;
 for (const c of cases) {
-  if (!c.from.test(original)) {
-    console.log(`SKIP  ${c.name}: anchor did not match — the fix moved, update this check`);
+  // Each case names the file it edits and the test it expects to go red; the
+  // default targets the tool layer.
+  const targetFile = c.file ?? 'lib/tools.js';
+  const targetPath = join(repo, targetFile);
+  const targetSource = readFileSync(targetPath, 'utf8');
+  if (!c.from.test(targetSource)) {
+    console.log(`SKIP  ${c.name}: anchor did not match in ${targetFile} — the fix moved, update this check`);
     failures++;
     continue;
   }
@@ -73,8 +89,8 @@ for (const c of cases) {
     recursive: true,
     filter: (src) => !src.includes('node_modules') && !src.includes(`${join('')}.git`),
   });
-  writeFileSync(join(dir, 'lib', 'tools.js'), original.replace(c.from, c.to));
-  const failed = failingTests(dir);
+  writeFileSync(join(dir, targetFile), targetSource.replace(c.from, c.to));
+  const failed = failingTests(dir, c.test ?? 'test/output-schema.test.mjs');
   if (failed.length === 0) {
     console.log(`FAIL  reverting "${c.name}" breaks nothing — the suite does not cover it`);
     failures++;
