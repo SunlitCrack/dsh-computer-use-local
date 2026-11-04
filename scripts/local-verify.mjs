@@ -80,10 +80,20 @@ try {
 
   section('P1/P2 unicode round trip (set_value on the search box)');
   const edits = elementsOf(base).filter((e) => e.role === 'Edit' && e.settable);
-  const searchBox = edits.find((e) => /search/i.test(e.automationId) || e.name === '\u641c\u7d22\u6846') ?? edits[0];
+  // The search box is the ONLY Edit that is not the address bar. Windows 10/11
+  // names it dynamically (" 在 <folder> 中搜索" / "Search <folder>"), so matching a
+  // fixed string misses it and silently falls through to edits[0] — which on an
+  // Explorer window is the ADDRESS BAR. Writing there navigates, so the read-back
+  // returns the folder path instead of the probe string (false P1 failure).
+  const isAddressBar = (e) => /^TextBox$/.test(String(e.automationId ?? ''))
+    && /地址栏|Address bar/i.test(String(e.name ?? ''));
+  const searchBox = edits.find((e) => /搜索|Search/i.test(String(e.name ?? '')))
+    ?? edits.find((e) => !isAddressBar(e))
+    ?? null;
   if (!searchBox) {
-    check('P1 unicode round trip', false, 'no settable Edit in this window');
+    check('P1 unicode round trip', false, 'no settable non-address-bar Edit in this window');
   } else {
+    console.log('target Edit ->', JSON.stringify({ name: searchBox.name, automationId: searchBox.automationId, path: searchBox.path }));
     const probe = 'unicode \u9a8c\u6536 42';
     const w = await call('set_value', {
       app: `hwnd:${base.window.hwnd}`, path: searchBox.path,
@@ -91,9 +101,16 @@ try {
       value: probe, snapshot_hwnd: base.window.hwnd,
     });
     const after = await state({ app: `hwnd:${base.window.hwnd}` });
-    // Match by AutomationId/role: the path can shift when the provider rebuilds.
+    // Read back by path AND name, never by automationId alone.
+    //
+    // On a real Explorer window the search box and the address bar BOTH report
+    // automationId 'TextBox' (measured: index 32 " 在 <dir> 中搜索" and index 27
+    // "地址栏"). elementsOf() is breadth-first, so matching on automationId lands
+    // on the address bar first — whose value is the current folder path. The old
+    // assertion then failed with a path-vs-probe mismatch that looked like a P1
+    // regression but was only ever this lookup picking the wrong element.
     const same = elementsOf(after).find((e) => e.role === 'Edit'
-      && (searchBox.automationId ? e.automationId === searchBox.automationId : e.path === searchBox.path));
+      && e.path === searchBox.path && e.name === searchBox.name);
     console.log('set_value ->', JSON.stringify(w));
     console.log('read back  ->', JSON.stringify(same?.value));
     check('P1 stdin UTF-8 round trip (CJK survives)', same?.value === probe, `${JSON.stringify(same?.value)} !== ${JSON.stringify(probe)}`);

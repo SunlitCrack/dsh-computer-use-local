@@ -49,6 +49,10 @@ public static class CuNative {
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  // P21: a minimized window keeps its old rect, so a screen read of it returns
+  // whatever is behind it. The pixel probe must refuse instead of reporting a
+  // dead picture as "unchanged".
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lParam);
   // LOCAL PATCH P2: CharSet.Unicode - without it this StringBuilder is
   // marshalled as ANSI, so GetWindowTextW's UTF-16 output is read back as
@@ -764,6 +768,134 @@ function Capture-WindowPng($hwnd, $rect) {
   $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
   $bmp.Dispose()
   return [Convert]::ToBase64String($ms.ToArray())
+}
+
+<#
+  pixel_probe — a deliberately dumb, very cheap look at the window.
+
+  WHY THIS EXISTS
+  ---------------
+  A full get_state costs ~820 ms, and measurement showed the cost is UIA attach +
+  expanding the first level of children, NOT tree size: a 3-element Notepad window
+  costs the same 820 ms as a 130-element Electron window, and maxDepth=0 drops to
+  72 ms. So no budget tuning can make observation cheap — the only lever is to
+  observe less often.
+
+  This action answers exactly one question: "does the window still look like it
+  did a moment ago?" It captures the window, downsamples to a small RGB grid and
+  returns the raw pixels. No UIA traversal, no tree, no fx overlay, no cursor
+  borrow. The caller diffs it against the previous probe.
+
+  WHAT IT MUST NOT BE USED FOR
+  ----------------------------
+  It carries no element identity, no element_index and no coordinates. It can say
+  "the pixels changed" but never "which element changed" or "did my click land".
+  Action verification still requires a real get_state. Treat the result as a hint
+  to skip a redundant re-observation, not as a substitute for observation.
+#>
+function Invoke-PixelProbe($params) {
+  $hwnd = Resolve-Window $params
+  if ($null -eq $hwnd) { Fail "target window not found: '$($params.app)'" }
+
+  # A minimized window still reports its old rect, and CopyFromScreen then reads
+  # whatever is behind it (measured: all-black, 0 non-zero bytes). Two consecutive
+  # probes of that dead picture are identical, so the caller would be told
+  # "unchanged, reuse the old tree" for a window that is not on screen at all.
+  if ([CuNative]::IsIconic($hwnd)) {
+    Fail 'target window is minimized; nothing to probe'
+  }
+
+  $rect = Get-WindowRectArr $hwnd
+  if ($null -eq $rect -or $rect.width -le 0 -or $rect.height -le 0) { Fail 'target window has no capturable bounds' }
+  $windowInfo = Get-ProcessInfo $hwnd
+
+  # Do NOT steal the foreground by default.
+  #
+  # The probe exists to be a ~100 ms read-only glance. get_state activates the
+  # target before capturing because it must photograph the TARGET rather than
+  # whatever covers it, but paying that cost here would mean a cheap read-only
+  # check yanks the user's active window away — measured: probing a background
+  # window moved the foreground from hwnd 132386 to 50463612. A probe that
+  # rearranges the desktop is not a probe.
+  #
+  # Instead, capture whatever is on screen and REPORT whether the target was in
+  # front. The caller decides: an occluded capture is a picture of the occluder,
+  # so a probe of a non-foreground window cannot vouch for that window's content.
+  # `activate: true` restores the old behaviour for callers that accept the swap.
+  $foreground = ([CuNative]::GetForegroundWindow() -eq $hwnd)
+  if ($params.activate -eq $true -and -not $foreground) {
+    if (-not (Activate-Window $hwnd)) { Fail "cannot bring window $($hwnd.ToInt64()) to the foreground; probe not captured" }
+    Start-Sleep -Milliseconds 60   # let the compositor settle before CopyFromScreen
+    $foreground = $true
+  }
+
+  # Defaults mirror lib/tools.js (160x90). The JS side always sends explicit
+  # values, so these exist only for direct kernel/MCP callers that omit them.
+  $targetW = if ($null -ne $params.width) { [Math]::Max(16, [Math]::Min(320, [int]$params.width)) } else { 160 }
+  $targetH = if ($null -ne $params.height) { [Math]::Max(16, [Math]::Min(320, [int]$params.height)) } else { 90 }
+
+  # Grab the WHOLE window first, then scale it down.
+  #
+  # CopyFromScreen is a bit-block transfer: its last argument is "how much to
+  # copy", NOT "what size to end up at". Pointing it at a 64x36 bitmap while the
+  # window is 900x700 copies the TOP-LEFT 64x36 CROP, and InterpolationMode has no
+  # effect on it. Measured with a 900x700 window: recolouring everything except
+  # that corner left the probe pixel-identical, so the gate answered "unchanged"
+  # while the entire page had changed. That is the one failure direction this
+  # feature must never have. DrawImage (source rect -> destination rect) does the
+  # actual resampling.
+  $full = New-Object System.Drawing.Bitmap([int]$rect.width, [int]$rect.height)
+  $gf = [System.Drawing.Graphics]::FromImage($full)
+  try {
+    $gf.CopyFromScreen($rect.x, $rect.y, 0, 0, $full.Size)
+  } finally {
+    $gf.Dispose()
+  }
+
+  $bmp = New-Object System.Drawing.Bitmap($targetW, $targetH)
+  $g = [System.Drawing.Graphics]::FromImage($bmp)
+  $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+  try {
+    $destRect = New-Object System.Drawing.Rectangle(0, 0, $targetW, $targetH)
+    $g.DrawImage($full, $destRect)
+  } finally {
+    $g.Dispose()
+    $full.Dispose()
+  }
+
+  # Pull the raw RGB bytes out without a PNG round-trip: the caller wants numbers,
+  # not an image, and encoding/decoding a PNG would cost more than the probe.
+  $bytes = New-Object byte[] ($targetW * $targetH * 3)
+  $i = 0
+  try {
+    for ($y = 0; $y -lt $targetH; $y += 1) {
+      for ($x = 0; $x -lt $targetW; $x += 1) {
+        $c = $bmp.GetPixel($x, $y)
+        $bytes[$i] = $c.R; $bytes[$i + 1] = $c.G; $bytes[$i + 2] = $c.B
+        $i += 3
+      }
+    }
+  } finally {
+    $bmp.Dispose()
+  }
+
+  return @{
+    ok = $true
+    width = $targetW
+    height = $targetH
+    window = $windowInfo
+    # The caller keys its baseline on this: one process can own several windows
+    # (two Explorer folders share a pid), and a pid-keyed baseline makes each
+    # window look changed to the other on every call.
+    hwnd = $hwnd.ToInt64()
+    # False means the capture shows whatever was covering the target, so this
+    # frame cannot vouch for the target's own content. The caller must treat a
+    # non-foreground probe as inconclusive rather than as "unchanged".
+    foreground = $foreground
+    # Base64 keeps the line-oriented stdio protocol intact (a raw byte array
+    # would have to be JSON-encoded as a huge number list).
+    rgb = [Convert]::ToBase64String($bytes)
+  }
 }
 
 # --- Codex-style effects overlaid onto a screenshot (model-facing view) ---
@@ -1863,6 +1995,7 @@ function Invoke-Command($params) {
   $action = [string]$params.action   # click | type_text | press_key | scroll | drag | set_value | select_text | perform_secondary_action
   $result = switch ($action) {
     'get_state' { Invoke-GetState $params }
+    'pixel_probe' { Invoke-PixelProbe $params }
     'list_apps' { Invoke-ListApps $params }
     'click' { Invoke-Action $params }
     'perform_secondary_action' { Invoke-Action $params }

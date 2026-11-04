@@ -80,6 +80,25 @@ $IDLE_VELOCITY_THRESHOLD = 28800.0
 $STIFFNESS = [Math]::Min([Math]::Pow((2 * [Math]::PI) / $RESPONSE, 2), $IDLE_VELOCITY_THRESHOLD)
 $DRAG = 2 * $DAMPING_FRACTION * [Math]::Sqrt($STIFFNESS)
 
+# Recompute the spring constants for a caller-supplied response time.
+#
+# Why this exists: response=1.4s is the official look, but it is charged on EVERY
+# pointer action before the real input commits, so a five-second tool step pays
+# 1.4s just to watch the cursor fly. The host may ask for a shorter response when
+# the caller only needs the landing to be visible, not celebrated. Clamped to
+# [0.25, 3.0]: below 0.25s the spring overshoots and the landing point stops being
+# readable as "where the click went"; above 3.0s the animation outlives its purpose.
+$RESPONSE_MIN = 0.25
+$RESPONSE_MAX = 3.0
+function Set-SpringResponse([double]$seconds) {
+  if ($seconds -lt $RESPONSE_MIN) { $seconds = $RESPONSE_MIN }
+  if ($seconds -gt $RESPONSE_MAX) { $seconds = $RESPONSE_MAX }
+  $script:RESPONSE = $seconds
+  $script:STIFFNESS = [Math]::Min([Math]::Pow((2 * [Math]::PI) / $seconds, 2), $IDLE_VELOCITY_THRESHOLD)
+  $script:DRAG = 2 * $DAMPING_FRACTION * [Math]::Sqrt($script:STIFFNESS)
+}
+
+
 # glyph metrics (SoftwareCursorGlyphMetrics / official reverse-engineered)
 $WINDOW_SIZE = 126
 $TIP_ANCHOR_X = 60.35
@@ -141,6 +160,8 @@ $doFog = if ($null -eq $params.fog) { $true } else { [bool]$params.fog }
 $doPulse = if ($null -eq $params.pulse) { ($kind -eq 'click') } else { [bool]$params.pulse }
 $interactionIndex = if ($null -eq $params.interactionIndex) { $points.Count - 1 } else { [int]$params.interactionIndex }
 $interactionIndex = [Math]::Max(0, [Math]::Min($interactionIndex, $points.Count - 1))
+# Optional per-play spring response (seconds). Absent => keep the official 1.4s.
+if ($null -ne $params.response) { Set-SpringResponse ([double]$params.response) }
 
 # Resident session mode: the first motion line carries serve:true and further
 # commands arrive on stdin while the overlay stays alive BETWEEN actions — the
@@ -193,6 +214,8 @@ function Start-SessionPlay($cmd) {
   $script:doPulse = if ($null -eq $cmd.pulse) { ($script:kind -eq 'click') } else { [bool]$cmd.pulse }
   $idx = if ($null -eq $cmd.interactionIndex) { $script:points.Count - 1 } else { [int]$cmd.interactionIndex }
   $script:interactionIndex = [Math]::Max(0, [Math]::Min($idx, $script:points.Count - 1))
+  # Per-play spring response survives across resident plays; absent keeps the last one.
+  if ($null -ne $cmd.response) { Set-SpringResponse ([double]$cmd.response) }
   $script:gateOpen = $false
   $script:waitCommit = $false
   $state.posX = [double]$script:points[0].x

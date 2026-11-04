@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { apply } from '../lib/index.js';
+import { ALL_TOOL_NAMES } from '../lib/tool-surface.js';
 
 test('embedded and standalone loading register the tool surface only once', () => {
   const names = [];
@@ -17,8 +18,8 @@ test('embedded and standalone loading register the tool surface only once', () =
   };
   apply(ctx, { updateCheck: false, audit: false, fx: { overlay: false } });
   apply(ctx, { updateCheck: false, audit: false, fx: { overlay: false } });
-  assert.equal(names.length, 10);
-  assert.equal(new Set(names).size, 10);
+  assert.equal(names.length, ALL_TOOL_NAMES.length);
+  assert.equal(new Set(names).size, ALL_TOOL_NAMES.length);
   for (const cleanup of cleanups.reverse()) cleanup();
 });
 
@@ -42,6 +43,7 @@ test('a throwing config does not wedge the duplicate guard', () => {
   );
   // The next apply must still be able to register the tool surface.
   apply(ctx, { updateCheck: false, audit: false, fx: { overlay: false } });
-  assert.equal(names.length, 10);
+  assert.equal(names.length, ALL_TOOL_NAMES.length);
   for (const cleanup of cleanups.reverse()) cleanup();
 });
+

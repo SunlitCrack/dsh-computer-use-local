@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { apply } from '../lib/index.js';
+import { ALL_TOOL_NAMES } from '../lib/tool-surface.js';
 
 const CONFIG = { updateCheck: false, audit: false, fx: { overlay: false } };
 
@@ -82,7 +83,7 @@ async function unload(harness) {
 test('without the seam the ten tools register directly', async () => {
   const h = makeHarness();
   apply(h.ctx, CONFIG);
-  assert.equal(h.names.length, 10);
+  assert.equal(h.names.length, ALL_TOOL_NAMES.length);
   assert.deepEqual(h.sections, ['tool:computer-use']);
   await unload(h);
   assert.equal(h.names.length, 0);
@@ -93,7 +94,7 @@ test('a free seam slot is claimed and released on unload', async () => {
   const h = makeHarness({ seam });
   apply(h.ctx, CONFIG);
   assert.equal(seam.registration, 'mimi-computer-use');
-  assert.equal(h.names.length, 10);
+  assert.equal(h.names.length, ALL_TOOL_NAMES.length);
   // The late-arrival watch stays idempotent once the slot is ours.
   h.fireInject();
   assert.equal(seam.registration, 'mimi-computer-use');
@@ -116,7 +117,7 @@ test('a seam slot held by another provider stands the tools down', async () => {
 test('a late seam whose slot is taken removes the already-registered tools', async () => {
   const h = makeHarness();
   apply(h.ctx, CONFIG);
-  assert.equal(h.names.length, 10);
+  assert.equal(h.names.length, ALL_TOOL_NAMES.length);
   assert.ok(h.hasInjectWatch());
   const taken = makeSeam('cua-driver-native');
   h.fireInject({ computerUse: taken });
@@ -132,7 +133,8 @@ test('a late seam with a free slot is claimed without disturbing the tools', asy
   const seam = makeSeam(undefined);
   h.fireInject({ computerUse: seam });
   assert.equal(seam.registration, 'mimi-computer-use');
-  assert.equal(h.names.length, 10);
+  assert.equal(h.names.length, ALL_TOOL_NAMES.length);
   await unload(h);
   assert.equal(seam.registration, undefined);
 });
+
